@@ -30,7 +30,7 @@ from flowui import busy
 
 print = flowui.say  # colored output, plain when piped
 
-VERSION = "1.1.1"
+VERSION = "1.1.2"
 
 if getattr(sys, "frozen", False) and os.name == "nt":
     # the PyInstaller exe points the DLL search at its temp folder; rojo would inherit that, load its runtime
@@ -220,6 +220,45 @@ def notify(title, msg):
 
 
 # ---------------------------------------------------------------- servers
+
+def in_job():
+    """True when this process runs inside a Windows job object. rokit runs every tool in a job that is killed
+    when the tool exits, which would take any server started from here down with it."""
+    if os.name != "nt":
+        return False
+    import ctypes
+
+    result = ctypes.c_int(0)
+    k32 = ctypes.windll.kernel32
+    k32.GetCurrentProcess.restype = ctypes.c_void_p
+    ok = k32.IsProcessInJob(ctypes.c_void_p(k32.GetCurrentProcess()), None, ctypes.byref(result))
+    return bool(ok and result.value)
+
+
+def spawn_detached(cmd, cwd, log):
+    """Start a long-lived server writing to log and return its pid. Outside a job a plain Popen is enough;
+    inside one (rokit) the process is created by WMI instead, so it is not part of the job and outlives flow.
+    The WMI process gets the user's normal environment, not this one."""
+    if not in_job():
+        with open(log, "w") as lf:
+            return subprocess.Popen(cmd, cwd=cwd, stdout=lf, stderr=subprocess.STDOUT, stdin=subprocess.DEVNULL,
+                                    creationflags=NO_WINDOW | 0x00000200).pid  # NO_WINDOW | NEW_PROCESS_GROUP
+    inner = f'{subprocess.list2cmdline(cmd)} > "{log}" 2>&1'
+    line = f'cmd.exe /d /s /c "{inner}"'
+    q = lambda s: "'" + str(s).replace("'", "''") + "'"  # noqa: E731
+    ps = (
+        "$s = New-CimInstance -ClassName Win32_ProcessStartup -ClientOnly -Property @{ShowWindow=[uint16]0};"
+        f"$r = Invoke-CimMethod -ClassName Win32_Process -MethodName Create -Arguments @{{CommandLine={q(line)};"
+        f"CurrentDirectory={q(cwd)}; ProcessStartupInformation=$s}};"
+        "if ($r.ReturnValue -ne 0) { exit [int]$r.ReturnValue }; $r.ProcessId"
+    )
+    p = subprocess.run(["powershell", "-NoProfile", "-NonInteractive", "-Command", ps], capture_output=True,
+                       text=True, creationflags=NO_WINDOW)
+    pid = p.stdout.strip().splitlines()[-1] if p.stdout.strip() else ""
+    if p.returncode != 0 or not pid.isdigit():
+        die(f"could not start {cmd[0]} outside rokit's job (WMI): {(p.stdout + p.stderr).strip()[-300:]}")
+    return int(pid)
+
 
 def pid_alive(pid):
     p = run(["tasklist", "/FI", f"PID eq {pid}", "/NH"])
@@ -429,18 +468,13 @@ def serve(slot, sinfo, wt, main):
         die(f"port {port} is used by something that is not a flow server. free it or change the slot port in {CONFIG}")
 
     log = HERE / f"rojo-{slot}.log"
-    flags = NO_WINDOW | 0x00000200  # NO_WINDOW | NEW_PROCESS_GROUP (DETACHED conflicts with NO_WINDOW)
-    with open(log, "w") as lf:
-        proc = subprocess.Popen(
-            ["rojo", "serve", "--port", str(port), "default.project.json"],
-            cwd=wt, stdout=lf, stderr=subprocess.STDOUT, stdin=subprocess.DEVNULL, creationflags=flags,
-        )
+    pid = spawn_detached(["rojo", "serve", "--port", str(port), "default.project.json"], wt, log)
     info = rojo_up(port)
     if not info:
-        kill_tree(proc.pid)
+        kill_tree(pid)
         die(f"rojo did not answer on {port}. log: {log}")
     st = state()
-    st[slot] = {"pid": proc.pid, "port": port, "worktree": str(wt), "started": time.time()}
+    st[slot] = {"pid": pid, "port": port, "worktree": str(wt), "started": time.time()}
     save_state(st)
 
     print(f"setup ok, port {port}. Connect Studio ({sinfo['label']}, place {sinfo['placeId']}) to localhost:{port}.")
