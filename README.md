@@ -73,6 +73,7 @@ flow push                              (sessions) mirror this worktree, HEAD + u
                                        `flow up --slot s` then: reinstalling under a running rojo breaks its sync)
 flow release [--slot s]                (sessions) free this worktree's slot; --slot frees any slot (yours only)
 flow down [slot | all]                 stop that slot's rojo server; `down all` (or --all) stops every one
+flow down --port N                     stop whatever rojo listens on port N (a stale server `flow status` warns about)
 flow restart [--all]                   restart the running servers on their current stage (--all: every slot);
                                        up, restart and update all regenerate Blink before serving
 flow update [--all]                    fast-forward local main to origin/main, then restart the running servers;
@@ -85,6 +86,8 @@ flow prune [--yes] [--branches] [--dirty] [--keep n ...] [--older-than 3]
                                        get a flow-archive/<name> branch). --branches also deletes fully-merged branches.
 flow where                             this worktree's slot, place id, port, stage, Studio connected
 flow status                            every slot: server, Studio connected (heuristic), which session holds it
+                                       status, where, doctor, wait and push first adopt servers flow lost track of
+                                       (a rojo it started, on a port no slot has): the slot's port is moved to it, no restart
 flow wait [slot] [--timeout 600]       block until a Studio connects; exit 3 on timeout (use as a background command)
 flow stamp                             write a fresh stamp (flow.json stamp.file, git-excluded); reading the
                                        StringValue back in Studio proves the Rojo sync is live, not stale
