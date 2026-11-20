@@ -30,7 +30,7 @@ from flowui import busy
 
 print = flowui.say  # colored output, plain when piped
 
-VERSION = "1.1.2"
+VERSION = "1.1.3"
 
 if getattr(sys, "frozen", False) and os.name == "nt":
     # the PyInstaller exe points the DLL search at its temp folder; rojo would inherit that, load its runtime
@@ -47,7 +47,8 @@ def project_key():
 
 
 _BASE = Path(os.environ.get("LOCALAPPDATA") or Path.home()) / "flow"  # per-machine state, not in git
-# FLOW_HOME is not read: older per-project flow copies set it user-wide, which would make every project share state.
+# FLOW_HOME is not read at all: older per-project flow copies set it user-wide (it made projects share state,
+# and counting its slots as another project's made a migrated project hand out new ports to itself).
 HERE = Path(os.environ["FLOW_STATE_DIR"]) if os.environ.get("FLOW_STATE_DIR") else _BASE / project_key()
 FLOW_ROOT = _BASE  # every project's folder sits here
 HERE.mkdir(parents=True, exist_ok=True)
@@ -110,10 +111,7 @@ def other_ports():
     """Ports claimed by other projects on this machine (their main place and their slots)."""
     mine = CONFIG.resolve()
     used = set()
-    configs = list(FLOW_ROOT.glob("*/config.json"))
-    if os.environ.get("FLOW_HOME"):  # a project on the older flow keeps its state there
-        configs.append(Path(os.environ["FLOW_HOME"]) / "config.json")
-    for path in configs:
+    for path in FLOW_ROOT.glob("*/config.json"):
         if not path.exists() or path.resolve() == mine:
             continue
         c = load_json(path, {})
@@ -279,6 +277,23 @@ def netstat_lines(port):
     return [l for l in out if l[0].rsplit(":", 1)[-1] == str(port)]
 
 
+def rojo_listeners():
+    """{port: pid} of every rojo process listening on this machine."""
+    ports = {}
+    for line in run(["netstat", "-ano", "-p", "TCP"]).stdout.splitlines():
+        parts = line.split()
+        if len(parts) >= 5 and parts[0] == "TCP" and parts[3] == "LISTENING" and parts[4].isdigit():
+            port = parts[1].rsplit(":", 1)[-1]
+            if port.isdigit():
+                ports[int(port)] = int(parts[4])
+    names = {}
+    for line in run(["tasklist", "/FO", "CSV", "/NH"]).stdout.splitlines():
+        cells = [c.strip('"') for c in line.split('","')]
+        if len(cells) >= 2 and cells[1].isdigit():
+            names[int(cells[1])] = cells[0].lower()
+    return {port: pid for port, pid in ports.items() if names.get(pid, "").startswith("rojo")}
+
+
 def listening(port):
     return any(l[2] == "LISTENING" for l in netstat_lines(port))
 
@@ -309,13 +324,23 @@ def pick_slot(cfg, name):
 
 
 def stop_slot(slot):
+    """Stop the slot's server: the one state.json records, and any rojo still listening on the slot's port
+    (a server state.json lost track of, e.g. after state was copied or edited by hand)."""
     st = state()
     info = st.pop(slot, None)
+    stopped = False
     if info and pid_alive(info["pid"]):
         kill_tree(info["pid"])
+        stopped = True
+    port = config()["slots"].get(slot, {}).get("port")
+    stray = rojo_listeners().get(port) if port else None
+    if stray:
+        kill_tree(stray)
+        stopped = True
+    if stopped:
         time.sleep(0.5)
     save_state(st)
-    return bool(info)
+    return bool(info) or stopped
 
 
 def user_only(cmd):
@@ -483,6 +508,13 @@ def serve(slot, sinfo, wt, main):
 
 def cmd_down(a):
     user_only("down")
+    if a.port:
+        pid = rojo_listeners().get(a.port)
+        if not pid:
+            die(f"no rojo is listening on port {a.port}")
+        kill_tree(pid)
+        print(f"stopped rojo on port {a.port} (pid {pid})")
+        return
     cfg = config()
     if a.all or a.slot == "all":
         if a.all and a.slot and a.slot != "all":
@@ -555,6 +587,60 @@ def cmd_restart(a):
     print("reconnect Studio on each restarted slot; sessions then `flow push` again to refresh the stamp")
     if not a.quiet:
         notify("flow: reconnect Studio", ", ".join(cfg["slots"][s]["label"] for s in done))
+
+
+def process_table():
+    """{pid: (parent pid, command line)} for every process, via CIM."""
+    ps = ("Get-CimInstance Win32_Process | ForEach-Object { \"$($_.ProcessId)`t$($_.ParentProcessId)`t$($_.CommandLine)\" }")
+    p = subprocess.run(["powershell", "-NoProfile", "-NonInteractive", "-Command", ps], capture_output=True,
+                       text=True, encoding="utf-8", errors="replace", creationflags=NO_WINDOW)
+    table = {}
+    for line in p.stdout.splitlines():
+        parts = line.split("\t", 2)
+        if len(parts) == 3 and parts[0].isdigit() and parts[1].isdigit():
+            table[int(parts[0])] = (int(parts[1]), parts[2])
+    return table
+
+
+def heal():
+    """Adopt servers this project started but lost track of: a rojo listening on a port no slot has, whose
+    launcher writes this project's `rojo-<slot>.log`. Its slot's port and state are pointed at it, so sessions
+    can push again without anyone restarting the server (which would disconnect Studio)."""
+    cfg = config()
+    known = {s["port"] for s in cfg["slots"].values()} | other_ports() | {main_port()}
+    strays = {port: pid for port, pid in rojo_listeners().items() if port not in known}
+    if not strays:
+        return
+    table = process_table()
+    log_re = re.compile(re.escape(str(HERE / "rojo-")) + r"([^\\/\"]+)\.log", re.I)
+    st = state()
+    changed = False
+    for port, pid in strays.items():
+        cur, slot, owner = pid, None, pid
+        for _ in range(5):
+            if cur not in table:
+                break
+            parent, line = table[cur]
+            m = log_re.search(line)
+            if m:
+                slot, owner = m.group(1), cur
+                break
+            cur = parent
+        if not slot or slot not in cfg["slots"]:
+            continue
+        info = st.get(slot)
+        if info and pid_alive(info["pid"]) and listening(cfg["slots"][slot]["port"]):
+            continue
+        old = cfg["slots"][slot]["port"]
+        cfg["slots"][slot]["port"] = port
+        st[slot] = {"pid": owner, "port": port, "worktree": str(main_checkout() / ".claude" / "worktrees" / stage_name(slot)),
+                    "started": time.time()}
+        changed = True
+        print(f"WARNING: {slot}'s server runs on port {port}, not {old}: flow lost track of it. Adopted it: "
+              f"{slot} now uses port {port} (connect its Studio to localhost:{port}).")
+    if changed:
+        CONFIG.write_text(json.dumps(cfg, indent=2), encoding="utf-8")
+        save_state(st)
 
 
 def slot_report(cfg, slot):
@@ -652,6 +738,7 @@ def cmd_release(a):
 
 
 def cmd_status(a):
+    heal()
     cfg = config()
     ls = leases()
     for slot in cfg["slots"]:
@@ -666,6 +753,12 @@ def cmd_status(a):
         else:
             print(f"{slot} {sinfo['label']} port {sinfo['port']} place {sinfo['placeId']}: not running")
     print(f"main place port {main_port()} (slots must differ)")
+    known = {s["port"] for s in cfg["slots"].values()} | other_ports() | {main_port()}
+    for port, pid in sorted(rojo_listeners().items()):
+        if port not in known:
+            print(f"WARNING: rojo on port {port} (pid {pid}) belongs to no slot of any project: a stale server. "
+                  f"Stop it with `flow down --port {port}`")
+    print(f"state: {HERE}")
     clash = [slot for slot, s in cfg["slots"].items() if s["port"] == main_port()]
     if clash:
         print(f"WARNING: {', '.join(clash)} use the main place's port; fix with flow slot <name> <placeId> --port <free port>")
@@ -696,6 +789,7 @@ def cmd_slot(a):
 
 
 def cmd_where(a):
+    heal()
     cfg = config()
     tree = toplevel()
     slot = lease_of(tree)
@@ -710,6 +804,7 @@ def cmd_where(a):
 
 def cmd_doctor(a):
     """Session preflight: claims this worktree's slot, then checks everything flow can check."""
+    heal()
     cfg = config()
     tree = toplevel()
     if is_stage(tree) or same_path(tree, main_checkout()):
@@ -744,6 +839,7 @@ def cmd_doctor(a):
 
 
 def cmd_wait(a):
+    heal()
     cfg = config()
     slot, sinfo = pick_slot(cfg, a.slot or lease_of(toplevel()))
     end = time.time() + a.timeout
@@ -995,6 +1091,7 @@ def regen_blink(tree):
 
 
 def cmd_push(a):
+    heal()
     src = toplevel()
     if not same_path(src, main_checkout()) and not is_stage(src):
         synced, msg = sync_with_main(src)
@@ -1400,6 +1497,7 @@ def main():
     s = sub.add_parser("down", help="stop a slot's server, or every server with `down all`")
     s.add_argument("slot", nargs="?")
     s.add_argument("--all", action="store_true", help="stop every slot's server")
+    s.add_argument("--port", type=int, help="stop whatever rojo listens on this port (a stale server)")
     s.set_defaults(fn=cmd_down)
 
     for name, pull, text in (("restart", False, "restart the running servers (all slots with --all)"),
