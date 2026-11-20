@@ -44,10 +44,12 @@ Optional, in the project root. Everything has a default; give only what differs.
 }
 ```
 
-- `stamp.file` is where `flow push` writes the stamp (git-excluded); `stamp.instance` is where it shows up in the game once Rojo syncs it (a StringValue).
+- `stamp.file` is where `flow push` writes the stamp (git-excluded); `stamp.instance` is where it shows up in the game once Rojo syncs it (a StringValue). `stamp.hint`: extra lines printed after a push, `{stamp}` is replaced by the new stamp (e.g. how to start the project's test harness).
 - `generated`: paths `flow check` refuses edits to.
 - `builtin`: the built-in Luau checks, each `"error"`, `"warn"` or `"off"`. `output` = print/warn without a `prefixedlogger`, `unused` = locals never used, `const` = `local` never reassigned, `server-only` = server APIs in `/Shared/` without an `IsServer` guard.
-- `rules`: the project's own non-negotiables, regex on added lines. Line rule: `id, severity (error|warn|off), pattern, message, paths?, except?, unless?`. File rule: `mustMatch` instead of `pattern` (the whole file must match when it changed). `paths`/`except` are globs, `**` crosses folders.
+- `rules`: the project's own non-negotiables, regex on added lines. Line rule: `id, severity (error|warn|off), pattern, message, paths?, except?, unless?, unlessPrev?` (`unless` skips the line when it matches, `unlessPrev` when the line before it matches). `multiline: true` runs `pattern` over the whole file and flags a match within 2 lines of an added line. File rule: `mustMatch` instead of `pattern` (the whole file must match when it changed). `paths`/`except` are globs, `**` crosses folders.
+- `checks`: the project's own check scripts for what a regex can't do, `[{ "id": "movesets", "run": ["lune", "run", "tools/checks/movesets", "--"] }]`. flow appends the path of a JSON file `{ base, files: { path: [added line numbers] } }`; the script prints findings as `ERROR path:line [rule] message` or `WARN ...` and exits 0, or 1 when it found errors.
+- `commands`: project commands that show up as `flow <name>`: `{ "overrides": { "run": ["lune", "run", "tools/x", "--"], "defaultArgs": ["--clip"], "help": "..." } }`. Arguments are passed through; `defaultArgs` are added when no positional argument is given.
 - A project without `flow.json` but with `flow.rules.json` is read the same way.
 
 ## Commands

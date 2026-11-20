@@ -20,6 +20,7 @@ import re
 import shutil
 import subprocess
 import sys
+import tempfile
 import time
 import urllib.request
 from pathlib import Path
@@ -29,7 +30,7 @@ from flowui import busy
 
 print = flowui.say  # colored output, plain when piped
 
-VERSION = "1.0.0"
+VERSION = "1.1.0"
 
 def project_key():
     """Folder name of the main checkout, so every project keeps its own slots and leases."""
@@ -851,6 +852,8 @@ PROJECT_DEFAULTS = {
     "generated": ["Packages/", "ServerPackages/", "DevPackages/", "sourcemap.json", "BlinkClient.luau", "BlinkServer.luau"],
     "builtin": {"output": "error", "unused": "error", "const": "warn", "server-only": "warn"},
     "rules": [],
+    "checks": [],
+    "commands": {},
 }
 _PROJECT = None
 
@@ -885,10 +888,8 @@ def stamp_path():
 
 def stamp_luau():
     parts = project()["stamp"]["instance"].split(".")
-    expr = f'game:GetService("{parts[0]}")'
-    for part in parts[1:]:
-        expr = f'{expr}:FindFirstChild("{part}")'
-    return f"local v = {expr} return v and v.Value"
+    steps = "".join(f' v = v and v:FindFirstChild("{part}")' for part in parts[1:])
+    return f'local v = game:GetService("{parts[0]}"){steps} return v and v.Value'
 
 
 # ---------------------------------------------------------------- stamp
@@ -1008,7 +1009,8 @@ def write_stamp(root, src):
     (root / stamp_path()).write_text(value, encoding="utf-8")
     print(value)
     print(f"1. Edit datamodel, must return exactly the stamp above (else Rojo isn't synced: stop, wait for reconnect): {stamp_luau()}")
-    print("2. Only then test: results from an unsynced place don't count.")
+    for line in project()["stamp"].get("hint", ["2. Only then test: results from an unsynced place don't count."]):
+        print(line.replace("{stamp}", value))
 
 
 # ---------------------------------------------------------------- check
@@ -1100,8 +1102,10 @@ def glob_re(pattern):
 
 def load_rules(root):
     """The project's own rules (flow.json "rules"), so the flow tool itself never needs editing.
-    Line rule: {id, severity, pattern, message, paths?, except?, unless?}. File rule: {id, severity, mustMatch,
-    message, paths?, except?}. Returns compiled rules; a broken rule is itself an error finding."""
+    Line rule: {id, severity, pattern, message, paths?, except?, unless?, unlessPrev?}; with multiline: true the
+    pattern runs over the whole file and a match counts when an added line is within 2 lines of it.
+    File rule: {id, severity, mustMatch, message, paths?, except?}.
+    Returns compiled rules; a broken rule is itself an error finding."""
     raw = project().get("rules", [])
     src = project().get("_file", "flow.json")
     rules = []
@@ -1118,6 +1122,8 @@ def load_rules(root):
                 "except": [glob_re(g) for g in r.get("except", [])],
                 "pattern": re.compile(r["pattern"]) if "pattern" in r else None,
                 "unless": re.compile(r["unless"]) if "unless" in r else None,
+                "unlessPrev": re.compile(r["unlessPrev"]) if "unlessPrev" in r else None,
+                "multiline": bool(r.get("multiline")),
                 "must": re.compile(r["mustMatch"], re.M) if "mustMatch" in r else None,
             })
         except Exception as e:
@@ -1129,15 +1135,59 @@ def apply_rules(rules, path, text, added):
     for r in rules:
         if not any(g.match(path) for g in r["paths"]) or any(g.match(path) for g in r["except"]):
             continue
-        if r["pattern"]:
+        if r["pattern"] and r["multiline"]:
+            for m in r["pattern"].finditer(text):
+                first = text[:m.start()].count("\n") + 1
+                last = text[:m.end()].count("\n") + 1
+                if any(first - 2 <= k <= last + 2 for k in added):
+                    finding(r["sev"], path, first, r["id"], r["msg"])
+        elif r["pattern"]:
+            lines = text.splitlines()
             for ln, line in added.items():
                 if is_comment(line) or not r["pattern"].search(line):
                     continue
                 if r["unless"] and r["unless"].search(line):
                     continue
+                prev = lines[ln - 2] if 2 <= ln <= len(lines) + 1 else ""
+                if r["unlessPrev"] and r["unlessPrev"].search(prev):
+                    continue
                 finding(r["sev"], path, ln, r["id"], r["msg"])
         if r["must"] and added and not r["must"].search(text):
             finding(r["sev"], path, 0, r["id"], r["msg"])
+
+
+FINDING_LINE = re.compile(r"^(ERROR|WARN)\s+(\S*?)(?::(\d+))?\s+\[([^\]]+)\]\s+(.*)$")
+
+
+def run_checks(root, base, added_by_file):
+    """The project's own check scripts (flow.json "checks": [{id, run: [cmd, ...]}]). Each gets a JSON file
+    path as its last argument: {base, files: {path: [added line numbers]}}, and prints findings as
+    `ERROR path:line [rule] message` or `WARN ...`. Other output is ignored."""
+    checks = project().get("checks", [])
+    if not checks:
+        return
+    with tempfile.NamedTemporaryFile("w", suffix=".json", delete=False, encoding="utf-8") as f:
+        json.dump({"base": base, "files": {k: sorted(v) for k, v in added_by_file.items()}}, f)
+        tmp = f.name
+    try:
+        for c in checks:
+            cid = c.get("id", "check")
+            cmd = list(c.get("run", []))
+            exe = shutil.which(cmd[0]) if cmd else None
+            if not exe:
+                finding("ERROR", "", 0, cid, f"check '{cid}' can't run: {cmd[0] if cmd else 'no run'} not found")
+                continue
+            p = run([exe] + cmd[1:] + [tmp], cwd=root, label=f"Running the {cid} check")
+            found = 0
+            for line in (p.stdout or "").splitlines():
+                m = FINDING_LINE.match(re.sub(r"\x1b\[[0-9;]*m", "", line).strip())
+                if m:
+                    finding(m.group(1), m.group(2), int(m.group(3) or 0), m.group(4), m.group(5))
+                    found += 1
+            if p.returncode not in (0, 1) or (p.returncode == 1 and not found):
+                finding("ERROR", "", 0, cid, f"check '{cid}' failed: {(p.stdout + p.stderr).strip()[-300:]}")
+    finally:
+        os.unlink(tmp)
 
 
 def changed_files(root, base):
@@ -1233,6 +1283,8 @@ def cmd_check(a):
         added_by_file[f] = added_lines(root, base, f)
         scan_file(root, base, f, text, added_by_file[f], rules)
 
+    run_checks(root, base, added_by_file)
+
     types = "type check skipped: no luau files changed"
     if luau:
         ok, msg = setup(root)
@@ -1256,11 +1308,30 @@ def cmd_check(a):
         print(f"{sev} {loc} [{rule}] {msg}")
     errs = sum(1 for f in FIND if f[0] == "ERROR")
     warns = len(FIND) - errs
-    print(f"checked {len(files)} files ({len(luau)} luau, {len(rules)} project rules) against {base[:10]}: {errs} errors, {warns} warnings")
+    print(f"checked {len(files)} files ({len(luau)} luau, {len(rules)} project rules, {len(project().get('checks', []))} project checks) against {base[:10]}: {errs} errors, {warns} warnings")
     print(types)
     print("not covered: behavior, feel, VFX")
     if errs:
         sys.exit(1)
+
+
+def cmd_project(a):
+    """A project command from flow.json "commands": {name: {run: [cmd, ...], help?, defaultArgs?}}.
+    defaultArgs are added when no positional argument is given."""
+    spec = project()["commands"][a.cmd]
+    args = list(a.args)
+    if not any(not x.startswith("-") for x in args):
+        args = list(spec.get("defaultArgs", [])) + args
+    cmd = list(spec["run"])
+    exe = shutil.which(cmd[0]) or die(f"{cmd[0]} not found on PATH (rokit install)")
+    sys.exit(subprocess.call([exe] + cmd[1:] + args, cwd=main_checkout() if spec.get("inMain") else toplevel()))
+
+
+def project_commands():
+    try:
+        return project().get("commands", {}) if run(["git", "rev-parse", "--git-dir"]).returncode == 0 else {}
+    except SystemExit:
+        return {}
 
 
 def main():
@@ -1323,6 +1394,12 @@ def main():
     s.add_argument("files", nargs="*")
     s.add_argument("--base")
     s.set_defaults(fn=cmd_check)
+    for name, spec in project_commands().items():
+        if name in sub.choices:
+            continue
+        s = sub.add_parser(name, help=spec.get("help", "project command (flow.json)"))
+        s.add_argument("args", nargs=argparse.REMAINDER)
+        s.set_defaults(fn=cmd_project)
     a = ap.parse_args()
     a.fn(a)
 
