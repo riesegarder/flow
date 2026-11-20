@@ -30,7 +30,14 @@ from flowui import busy
 
 print = flowui.say  # colored output, plain when piped
 
-VERSION = "1.1.0"
+VERSION = "1.1.1"
+
+if getattr(sys, "frozen", False) and os.name == "nt":
+    # the PyInstaller exe points the DLL search at its temp folder; rojo would inherit that, load its runtime
+    # DLLs from there and keep the folder from being deleted when flow exits
+    import ctypes
+
+    ctypes.windll.kernel32.SetDllDirectoryW(None)
 
 def project_key():
     """Folder name of the main checkout, so every project keeps its own slots and leases."""
