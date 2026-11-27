@@ -37,7 +37,7 @@ from flowui import busy
 
 print = flowui.say  # colored output, plain when piped
 
-VERSION = "1.3.1"
+VERSION = "1.3.2"
 WINDOWS = os.name == "nt"
 NO_WINDOW = 0x08000000 if WINDOWS else 0  # CREATE_NO_WINDOW: no subprocess ever pops up a console window
 
@@ -606,10 +606,16 @@ def spawn_detached(cmd, cwd, log):
             return subprocess.Popen(cmd, cwd=cwd, stdout=lf, stderr=subprocess.STDOUT, stdin=subprocess.DEVNULL,
                                     creationflags=NO_WINDOW | 0x00000200).pid  # NO_WINDOW | NEW_PROCESS_GROUP
     inner = f'{subprocess.list2cmdline(cmd)} > "{log}" 2>&1'
-    line = f'cmd.exe /d /s /c "{inner}"'
+    return create_outside_job(f'cmd.exe /d /s /c "{inner}"', cwd, cmd[0])
+
+
+def create_outside_job(line, cwd, what, show=False):
+    """Start a command line through WMI and return its pid. WMI's process is not part of rokit's job, which kills
+    everything in it when flow exits. It gets the user's normal environment, not this one."""
     q = lambda s: "'" + str(s).replace("'", "''") + "'"  # noqa: E731
     ps = (
-        "$s = New-CimInstance -ClassName Win32_ProcessStartup -ClientOnly -Property @{ShowWindow=[uint16]0};"
+        # ShowWindow: 1 shows the window (SW_SHOWNORMAL), 0 hides it (SW_HIDE)
+        f"$s = New-CimInstance -ClassName Win32_ProcessStartup -ClientOnly -Property @{{ShowWindow=[uint16]{int(show)}}};"
         f"$r = Invoke-CimMethod -ClassName Win32_Process -MethodName Create -Arguments @{{CommandLine={q(line)};"
         f"CurrentDirectory={q(cwd)}; ProcessStartupInformation=$s}};"
         "if ($r.ReturnValue -ne 0) { exit [int]$r.ReturnValue }; $r.ProcessId"
@@ -618,7 +624,7 @@ def spawn_detached(cmd, cwd, log):
                        text=True, creationflags=NO_WINDOW)
     pid = p.stdout.strip().splitlines()[-1] if p.stdout.strip() else ""
     if p.returncode != 0 or not pid.isdigit():
-        die(f"could not start {cmd[0]} outside rokit's job (WMI): {(p.stdout + p.stderr).strip()[-300:]}")
+        die(f"could not start {what} outside rokit's job (WMI): {(p.stdout + p.stderr).strip()[-300:]}")
     return int(pid)
 
 
@@ -1915,9 +1921,15 @@ def studio_handler():
 
 
 def launch_studio(uri):
-    """Open a roblox-studio: link. Starts Studio's launcher directly: from the packaged flow.exe, os.startfile
-    returned without Studio ever starting. The launcher gets the environment without PyInstaller's variables."""
+    """Open a roblox-studio: link with Studio's launcher. Under rokit, flow runs in a job that kills everything in
+    it when flow exits, Studio included (it started and died at once), so there Studio is created outside it."""
     exe = studio_handler()
+    if exe and in_job():
+        try:
+            create_outside_job(subprocess.list2cmdline([exe, uri]), Path(exe).parent, "Studio", show=True)
+            return True
+        except SystemExit:  # die() already said why
+            return False
     try:
         if not exe:
             os.startfile(uri)
