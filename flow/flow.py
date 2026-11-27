@@ -37,7 +37,7 @@ from flowui import busy
 
 print = flowui.say  # colored output, plain when piped
 
-VERSION = "1.3.0"
+VERSION = "1.3.1"
 WINDOWS = os.name == "nt"
 NO_WINDOW = 0x08000000 if WINDOWS else 0  # CREATE_NO_WINDOW: no subprocess ever pops up a console window
 
@@ -1900,6 +1900,38 @@ def cmd_open(a):
     open_places(cfg, targets, force=a.force)
 
 
+def studio_handler():
+    """The exe Windows runs for roblox-studio: links (Studio's launcher), or None."""
+    try:
+        import winreg
+
+        with winreg.OpenKey(winreg.HKEY_CLASSES_ROOT, r"roblox-studio\shell\open\command") as k:
+            cmd = winreg.QueryValueEx(k, "")[0]
+    except OSError:
+        return None
+    m = re.match(r'\s*"([^"]+)"|\s*(\S+)', cmd)
+    exe = m and (m.group(1) or m.group(2))
+    return exe if exe and Path(exe).exists() else None
+
+
+def launch_studio(uri):
+    """Open a roblox-studio: link. Starts Studio's launcher directly: from the packaged flow.exe, os.startfile
+    returned without Studio ever starting. The launcher gets the environment without PyInstaller's variables."""
+    exe = studio_handler()
+    try:
+        if not exe:
+            os.startfile(uri)
+            return True
+        env = {k: v for k, v in os.environ.items() if not k.upper().startswith(("_PYI", "_MEI"))}
+        subprocess.Popen([exe, uri], env=env, stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL,
+                         stderr=subprocess.DEVNULL, close_fds=True,
+                         creationflags=0x00000008 | 0x00000200)  # DETACHED_PROCESS | CREATE_NEW_PROCESS_GROUP
+        return True
+    except OSError as e:
+        print(f"WARNING: couldn't start Studio ({exe or uri}): {e}")
+        return False
+
+
 def open_places(cfg, targets, force=False):
     """Open the slots' places in Studio, skipping ones a Studio already has. Returns the slots it opened."""
     try:
@@ -1923,7 +1955,8 @@ def open_places(cfg, targets, force=False):
             continue
         if opened:
             time.sleep(2)  # one Studio launch at a time
-        os.startfile(f"roblox-studio:1+launchmode:edit+task:EditPlace+placeId:{s['placeId']}+universeId:{uid}")
+        if not launch_studio(f"roblox-studio:1+launchmode:edit+task:EditPlace+placeId:{s['placeId']}+universeId:{uid}"):
+            continue
         opened.append(slot)
         running = slot_report(cfg, slot)[2]
         if not running:
