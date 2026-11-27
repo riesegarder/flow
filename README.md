@@ -13,14 +13,21 @@ Through [rokit](https://github.com/rojo-rbx/rokit), pinned per project like ever
 ```toml
 # rokit.toml
 [tools]
-flow = "riesegarder/flow@1.2.0"
+flow = "riesegarder/flow@1.3.0"
 ```
 
 `rokit install`, then `flow --version`. To update a project, bump the version and `rokit install` again.
 
 Windows builds run everything; Linux and macOS builds run `flow check` and project commands (the server commands are Windows only).
 
-Needs `git` and `rojo` on PATH; `wally`, `wally-package-types`, `blink`, `stylua` and `luau-lsp` are used when the project has them.
+Needs `git`, `rojo` and [rojo-flow](https://github.com/riesegarder/rojo-flow) on PATH; `wally`, `wally-package-types`, `blink`, `stylua` and `luau-lsp` are used when the project has them. rojo-flow is pinned once per machine, not per project, so teammates who don't use flow never see it:
+
+```
+rokit add --global riesegarder/rojo-flow
+rokit trust riesegarder/rojo-flow
+```
+
+`FLOW_ROJO_FLOW=<path>` uses another rojo-flow binary (a local build, for example).
 
 ## Project settings: `flow.json`
 
@@ -89,16 +96,17 @@ flow pin [version]                     pin this project's rokit.toml to the late
                                        out (FLOW_NO_UPDATE_CHECK=1 turns that off)
 flow register                          reserve the main place port (servePort in default.project.json)
 flow up [slot ...] [--all] [--quiet]   fetch origin and warn if local main is behind origin/main (pull first), then
-                                       serve each slot's stage: setup (below), blink network.blink, rojo serve, then
-                                       "setup ok, port N. Connect Studio...". Once per slot; you connect once.
+                                       serve each slot's stage: setup (below), blink network.blink, rojo-flow serve, then
+                                       "setup ok, port N". Studio syncs each slot by itself once its place is open
+                                       (up waits a few seconds for places that already are).
                                        No slot: the default one. --tree <name> serves a worktree instead of the stage
                                        (push then refuses).
 flow doctor [slot]                     (sessions) claim a free slot (connected Studios first) + preflight + setup of the
                                        session worktree; rebases the session branch onto local main when it's behind
                                        (the app branches new worktrees from origin/main, so unpushed main commits would
                                        be missing) and prints each commit's old -> new hash. Finds the slot's Studio
-                                       through the Studio MCP and prints its studio_id; warns when Studio's Rojo plugin
-                                       doesn't fit the project's rojo (version, or upstream plugin with the fork pinned)
+                                       through the Studio MCP and prints its studio_id; notes when the rojo-flow plugin
+                                       isn't installed yet
 flow push                              (sessions) mirror this worktree, HEAD + uncommitted edits, onto its slot's stage + stamp,
                                        then read the stamp back from Studio (below); rebases onto local main first, refuses
                                        if that conflicts (never stages old code); regenerates the Blink networking files on
@@ -142,13 +150,11 @@ flow check [files] [--base REF]        setup, then stylua --check (respecting .s
 
 A server is "running" when a rojo listens on its slot's port, whatever pid was recorded. Slot leases are taken under a lock, so sessions starting at the same moment never get the same slot.
 
-**Auto-reconnecting plugin.** With the [riesegarder/rojo](https://github.com/riesegarder/rojo) fork (`-reconnect` releases, "Reconnect On Server Loss" on), Studio reconnects by itself when its server comes back on the same port. flow detects the fork from the installed plugin (`%LOCALAPPDATA%\Roblox\Plugins\RojoManagedPlugin.rbxm`) and its setting; then restarting a slot Studio was connected to (`restart`, `update`, `up`, `slot`, or push restarting a crashed server) toasts "reconnecting", waits, and toasts "reconnected" (or "connect Studio" if it doesn't come back within 30 s). `FLOW_ROJO_RECONNECT=1`/`0` overrides the detection. `flow ports` still needs a manual connect: the plugin keeps retrying the old port.
+**rojo-flow.** Slots are served by [rojo-flow](https://github.com/riesegarder/rojo-flow), not stock Rojo: its own server plus a Studio plugin without UI (`RojoFlowPlugin.rbxm`, next to the stock `RojoManagedPlugin.rbxm`). flow installs the plugin itself whenever it's missing or another rojo-flow version installed it; open Studios load it without a restart. flow lists every served slot's place and port in `~/.flow/places.json`; rojo-flow servers serve that file on `127.0.0.1:34870` (slots never get that port), and the plugin in each Studio looks its place up there every 3 s. A listed place syncs by itself, with no Connect and no confirmation; any other place is left alone. When its server dies the plugin keeps retrying, so restarting a slot Studio was connected to (`restart`, `update`, `up`, `slot`, or push restarting a crashed server) toasts "reconnecting", waits, and toasts "reconnected". `flow ports` needs nothing in Studio either: the plugin looks the new port up. rojo-flow servers refuse the stock Rojo plugin, so a slot is never synced twice. `FLOW_ROJO_RECONNECT=1`/`0` overrides the plugin detection.
 
 **Stamp check.** flow talks to Roblox's own `StudioMCP.exe` (the server behind the roblox-studio MCP; flow starts the newest one under `%LOCALAPPDATA%\Roblox\Versions`, `FLOW_STUDIO_MCP` overrides it). After a push it finds the Studio that has the slot's place open and reads `stamp.instance` in its Edit datamodel, read-only, until it equals the new stamp (20 s at most). Synced: it prints `Studio synced` and the studio_id to use. Another value: exit 5, test nothing. When it can't ask (Studio closed, its MCP server off), it prints the Luau to check by hand as before. Studio not connected: it says so; `flow wait` checks the stamp once Studio is back.
 
-Studio's Rojo plugin remembers the port per place, so you connect each slot once and only press Connect after that.
-
-**State.** Slots are in `flow.json` (shared). This machine's ports, leases, running servers and Rojo logs are in the repo's git folder, `.git/flow/` (per machine, per project, never committed; `FLOW_STATE_DIR` overrides it). Which ports each project uses is recorded machine-wide in `~/.flow/ports.json`. Nothing is kept in `%LOCALAPPDATA%` any more: the Claude desktop app is a packaged app, and Windows gives everything it starts a private copy of `%LOCALAPPDATA%`, so flow in a session and flow in a normal terminal saw two different state files. The first 1.2 run takes over a project's 1.1 state from `%LOCALAPPDATA%\flow\<project>`, and the first user command after that saves its slots in `flow.json`.
+**State.** Slots are in `flow.json` (shared). This machine's ports, leases, running servers and Rojo logs are in the repo's git folder, `.git/flow/` (per machine, per project, never committed; `FLOW_STATE_DIR` overrides it). Which ports each project uses is recorded machine-wide in `~/.flow/ports.json`, and which place each served slot syncs in `~/.flow/places.json` (for rojo-flow). Nothing is kept in `%LOCALAPPDATA%` any more: the Claude desktop app is a packaged app, and Windows gives everything it starts a private copy of `%LOCALAPPDATA%`, so flow in a session and flow in a normal terminal saw two different state files. The first 1.2 run takes over a project's 1.1 state from `%LOCALAPPDATA%\flow\<project>`, and the first user command after that saves its slots in `flow.json`.
 
 **Setup** (up, doctor, check; never under a running rojo) runs the real installs in that worktree, never links to another checkout: `rokit install`, `wally install` (only when `wally.toml`/`wally.lock` changed since the last install; the hash lives in the worktree's git dir as `flow-wally`), `rojo sourcemap` (every time), then `wally-package-types` after an install. Old `Packages`/`ServerPackages` junctions are removed first.
 

@@ -24,7 +24,6 @@ import platform
 import queue
 import re
 import shutil
-import struct
 import subprocess
 import sys
 import tempfile
@@ -38,7 +37,7 @@ from flowui import busy
 
 print = flowui.say  # colored output, plain when piped
 
-VERSION = "1.2.0"
+VERSION = "1.3.0"
 WINDOWS = os.name == "nt"
 NO_WINDOW = 0x08000000 if WINDOWS else 0  # CREATE_NO_WINDOW: no subprocess ever pops up a console window
 
@@ -488,6 +487,7 @@ def other_ports():
         c = load_json(path, {})
         used.update(s.get("port", 0) for s in c.get("slots", {}).values())
         used.add(c.get("mainPort", 0))
+    used.add(DISCOVERY_PORT)
     used.discard(0)
     used.discard(None)
     _OTHER = used
@@ -701,90 +701,58 @@ def crashed(slot):
         return False
 
 
-def lz4_block(src, size):
-    """Decompress one LZ4 block (how binary .rbxm files store their chunks)."""
-    dst, i, n = bytearray(), 0, len(src)
-    while i < n:
-        token = src[i]
-        i += 1
-        lit = token >> 4
-        if lit == 15:
-            while True:
-                b = src[i]
-                i += 1
-                lit += b
-                if b != 255:
-                    break
-        dst += src[i:i + lit]
-        i += lit
-        if i >= n:
-            break
-        off = src[i] | (src[i + 1] << 8)
-        i += 2
-        ml = token & 15
-        if ml == 15:
-            while True:
-                b = src[i]
-                i += 1
-                ml += b
-                if b != 255:
-                    break
-        ml += 4
-        start = len(dst) - off
-        if off >= ml:
-            dst += dst[start:start + ml]
-        else:
-            for k in range(ml):
-                dst.append(dst[start + k])
-    return bytes(dst[:size])
-
-
-def rbxm_bytes(path):
-    """The chunk data of a binary .rbxm, decompressed, for a substring search (XML models are plain text)."""
-    data = Path(path).read_bytes()
-    if not data.startswith(b"<roblox!"):
-        return data
-    out, i = [], 32  # magic 8 + signature 6 + version 2 + class count 4 + instance count 4 + reserved 8
-    while i + 16 <= len(data):
-        name = data[i:i + 4]
-        clen, ulen = struct.unpack_from("<II", data, i + 4)
-        i += 16
-        body = data[i:i + (clen or ulen)]
-        i += clen or ulen
-        if not clen:
-            out.append(body)
-        elif body[:4] != b"\x28\xb5\x2f\xfd":  # zstd chunks are skipped
-            out.append(lz4_block(body, ulen))
-        if name == b"END\0":
-            break
-    return b"".join(out)
-
-
 ROBLOX_DIR = Path(os.environ.get("LOCALAPPDATA") or Path.home()) / "Roblox"
-PLUGIN_FILE = ROBLOX_DIR / "Plugins" / "RojoManagedPlugin.rbxm"  # where `rojo plugin install` puts it
-PLUGIN_CACHE = Path.home() / ".flow" / "rojo-plugin.json"
-PLUGIN_VERSION = re.compile(rb"Version[\x00-\xff]{0,40}?Value\x01([\x00-\xff]{4})(\d+\.\d+\.\d+[\w.+-]*)")
+FLOW_PLUGIN = ROBLOX_DIR / "Plugins" / "RojoFlowPlugin.rbxm"  # where `rojo-flow plugin install` puts it
+FLOW_PLUGIN_STAMP = Path.home() / ".flow" / "rojo-flow-plugin.json"  # which rojo-flow installed that file
+PLACES = Path.home() / ".flow" / "places.json"  # {placeId: {port, slot, project}}: rojo-flow serves it to Studio
+DISCOVERY_PORT = 34870  # rojo-flow servers serve PLACES here; slots never get it
 
 
-def plugin_info():
-    """{"version": "7.7.1", "fork": bool} of the Rojo plugin in Studio's Plugins folder, or None when there is
-    none. fork: the riesegarder/rojo plugin (it has the "Reconnect On Server Loss" setting). Cached per file."""
+def rojo_flow():
+    """The rojo-flow executable: FLOW_ROJO_FLOW (a path, for testing a build), else rojo-flow on PATH."""
+    exe = os.environ.get("FLOW_ROJO_FLOW") or shutil.which("rojo-flow")
+    if not exe:
+        die("rojo-flow is not installed. flow serves slots with it (https://github.com/riesegarder/rojo-flow): "
+            "`rokit add --global riesegarder/rojo-flow`, then `rokit trust riesegarder/rojo-flow`")
+    return exe
+
+
+def ensure_flow_plugin(exe):
+    """Install rojo-flow's Studio plugin when it's missing, or was installed by another rojo-flow version or
+    changed since. Studio loads the new file by itself, no restart."""
+    version = run([exe, "--version"]).stdout.strip()
     try:
-        st = PLUGIN_FILE.stat()
+        st = FLOW_PLUGIN.stat()
+        key = [st.st_mtime, st.st_size]
     except OSError:
-        return None
-    key = [st.st_mtime, st.st_size]
-    cache = load_json(PLUGIN_CACHE, {})
-    if cache.get("key") == key and "version" in cache:
-        return {"version": cache["version"], "fork": cache.get("fork", False)}
-    try:
-        data = rbxm_bytes(PLUGIN_FILE)
-    except Exception:
-        data = b""
-    m = PLUGIN_VERSION.search(data)
-    info = {"version": m.group(2).decode() if m else None, "fork": b"reconnectForever" in data}
-    write_json(PLUGIN_CACHE, {"key": key, **info})
-    return info
+        key = None
+    if key and load_json(FLOW_PLUGIN_STAMP, {}) == {"version": version, "key": key}:
+        return
+    r = run([exe, "plugin", "install"], label="Installing the rojo-flow Studio plugin")
+    if r.returncode != 0:
+        print(f"WARNING: `rojo-flow plugin install` failed, Studio won't sync by itself:\n{(r.stdout + r.stderr).strip()}")
+        return
+    st = FLOW_PLUGIN.stat()
+    write_json(FLOW_PLUGIN_STAMP, {"version": version, "key": [st.st_mtime, st.st_size]})
+    print(f"installed the rojo-flow Studio plugin ({version}); open Studios load it by themselves")
+
+
+def places_set(slot, sinfo, port):
+    """Tell rojo-flow's plugin which port serves this slot's place."""
+    places = load_json(PLACES, {})
+    places[str(sinfo["placeId"])] = {"port": port, "slot": slot, "project": str(main_checkout())}
+    write_json(PLACES, places)
+
+
+def places_drop(slot=None, port=None):
+    """Forget this project's entry for slot, or any entry on port: the plugin stops looking for it."""
+    places = load_json(PLACES, {})
+    mine = os.path.normcase(str(main_checkout())) if slot else None
+    keep = {pid: e for pid, e in places.items()
+            if not ((slot and e.get("slot") == slot and os.path.normcase(e.get("project", "")) == mine)
+                    or (port and e.get("port") == port))}
+    if keep != places:
+        write_json(PLACES, keep)
 
 
 def semver(text):
@@ -793,53 +761,19 @@ def semver(text):
 
 
 def plugin_problems():
-    """Warnings about Studio's Rojo plugin against this project's rojo: a version Rojo refuses, or the upstream
-    plugin while rokit.toml pins the reconnecting fork."""
-    out = []
-    info = plugin_info()
-    main = main_checkout()
-    if not info:
-        return [f"note: no Rojo plugin in {PLUGIN_FILE.parent} (`rojo plugin install` puts it there); flow can't "
-                "check its version or whether it reconnects by itself"]
-    r = run(["rojo", "--version"], cwd=main)
-    have, want = semver(info["version"]), semver(r.stdout)
-    if have and want and have[:2] != want[:2]:
-        out.append(f"WARNING: Studio's Rojo plugin is {info['version']} but this project's rojo is "
-                   f"{'.'.join(map(str, want))}: they won't sync. Run `rojo plugin install` in {main.name}, then "
-                   "restart Studio")
-    toml = main / "rokit.toml"
-    pins_fork = toml.exists() and re.search(r'"riesegarder/rojo@', toml.read_text(encoding="utf-8", errors="replace"))
-    if pins_fork and not info["fork"]:
-        out.append("WARNING: rokit.toml pins the riesegarder/rojo fork but Studio has the upstream Rojo plugin, "
-                   f"which never reconnects by itself. Run `rojo plugin install` in {main.name}, then restart Studio")
-    return out
+    """Warnings about Studio's side of the sync."""
+    if FLOW_PLUGIN.exists():
+        return []
+    return [f"note: the rojo-flow Studio plugin isn't in {FLOW_PLUGIN.parent} yet; `flow up` installs it"]
 
 
 def plugin_reconnects():
-    """True when Studio's Rojo plugin reconnects by itself after its server restarts: the riesegarder/rojo
-    fork ("-reconnect" releases) with its "Reconnect On Server Loss" setting on. FLOW_ROJO_RECONNECT=1/0
-    overrides the detection."""
+    """True when Studio syncs a slot by itself after its server (re)starts: the rojo-flow plugin is installed.
+    FLOW_ROJO_RECONNECT=1/0 overrides the detection."""
     env = os.environ.get("FLOW_ROJO_RECONNECT")
     if env in ("0", "1"):
         return env == "1"
-    info = plugin_info()
-    if not info or not info["fork"]:
-        return False
-    # the plugin keeps its settings per Roblox account; the most recently written one that has it decides
-    found = []
-    for p in ROBLOX_DIR.glob("*/InstalledPlugins/0/settings.json"):
-        try:
-            found.append((p.stat().st_mtime, p))
-        except OSError:
-            pass
-    for _, p in sorted(found, reverse=True):
-        try:
-            settings = json.loads(p.read_text(encoding="utf-8-sig"))
-        except (OSError, ValueError):
-            continue
-        if "Rojo_reconnectForever" in settings:
-            return settings["Rojo_reconnectForever"] is not False
-    return True  # on by default
+    return FLOW_PLUGIN.exists()
 
 
 def studio_connected(port):
@@ -865,9 +799,31 @@ def await_reconnect(slots, quiet=False, timeout=30):
         if not quiet:
             notify("flow: reconnected", port_list(back))
     if left:
-        print(f"WARNING: Studio didn't reconnect within {timeout}s: {port_list(left)}. Press Connect there.")
+        print(f"WARNING: Studio didn't reconnect within {timeout}s: {port_list(left)}. "
+              + ("Is the place still open in Studio?" if plugin_reconnects() else "Press Connect there."))
         if not quiet:
             notify("flow: connect Studio", port_list(left))
+    return left
+
+
+def await_open(slots, quiet=False, timeout=8):
+    """Slots Studio wasn't connected to: rojo-flow's plugin syncs each one by itself once its place is open, so
+    wait briefly for places that already are, and say which ones still need opening."""
+    cfg = config()
+    left = list(slots)
+    end = time.time() + timeout
+    with busy(f"Waiting for Studio to sync {', '.join(slots)}"):
+        while left and time.time() < end:
+            time.sleep(1)
+            left = [s for s in left if not studio_connected(cfg["slots"][s]["port"])]
+    back = [s for s in slots if s not in left]
+    if back:
+        print(f"Studio synced by itself: {port_list(back)}")
+    if left:
+        print("open these places in Studio (`flow open <slot>`); they sync by themselves: "
+              + ", ".join(f"{s} ({cfg['slots'][s]['label']})" for s in left))
+        if not quiet:
+            notify("flow: open in Studio", port_list(left))
     return left
 
 
@@ -876,7 +832,8 @@ def rojo_up(port, timeout=25):
     with busy(f"Waiting for Rojo to answer on port {port}"):
         while time.time() < end:
             try:
-                with urllib.request.urlopen(f"http://127.0.0.1:{port}/api/rojo", timeout=2) as r:
+                req = urllib.request.Request(f"http://127.0.0.1:{port}/api/rojo", headers={"Rojo-Flow": "1"})
+                with urllib.request.urlopen(req, timeout=2) as r:
                     return r.status == 200
             except Exception:
                 time.sleep(0.5)
@@ -1052,6 +1009,7 @@ def slot_report(cfg, slot):
 def stop_slot(slot):
     """Stop the slot's server: any rojo on the slot's port (or the port state.json recorded), and the launcher
     state.json recorded if it's still there."""
+    places_drop(slot=slot)
     st = state()
     info = st.pop(slot, None) or {}
     ports = {config()["slots"].get(slot, {}).get("port"), info.get("port")} - {None}
@@ -1063,7 +1021,7 @@ def stop_slot(slot):
             kill_tree(pid)
             stopped = True
     pid = info.get("pid")
-    if pid and snapshot()[2].get(pid) in ("cmd.exe", "rojo.exe"):
+    if pid and snapshot()[2].get(pid) in ("cmd.exe", "rojo.exe", "rojo-flow.exe"):
         kill_tree(pid)
         stopped = True
     if stopped:
@@ -1143,7 +1101,9 @@ def up_slots(targets, tree=None, base="main", quiet=False):
         else:
             done.append(slot)
     print()
-    if not quiet and done:
+    if done and plugin_reconnects():
+        await_open(done, quiet)
+    elif not quiet and done:
         notify("flow: connect Studio", port_list(done))
     if auto:
         await_reconnect(auto, quiet)
@@ -1214,8 +1174,8 @@ def slot_place_ids():
 
 
 def serve(slot, sinfo, wt, main):
-    """Serve wt on the slot's port. Returns True when Studio was connected to the old server on this port and
-    its plugin reconnects by itself (the riesegarder/rojo fork), so nobody has to press Connect."""
+    """Serve wt on the slot's port with rojo-flow. Returns True when Studio was connected to the old server on
+    this port and its plugin reconnects by itself (rojo-flow's plugin), so nobody has to press Connect."""
     was = studio_connected(sinfo["port"])
     if stop_slot(slot):  # before setup: rojo stops syncing package folders that are reinstalled under it
         print(f"stopped the previous server on {slot}")
@@ -1241,18 +1201,21 @@ def serve(slot, sinfo, wt, main):
         die(f"port {port} is used by {snapshot()[2].get(pid, 'another program')} (pid {pid}), not a flow server. "
             "Free it, or move the slots with `flow ports`.")
 
+    exe = rojo_flow()
+    ensure_flow_plugin(exe)
     log = log_path(slot)
-    launcher = spawn_detached(["rojo", "serve", "--port", str(port), "default.project.json"], wt, log)
+    launcher = spawn_detached([exe, "serve", "--port", str(port), "default.project.json"], wt, log)
     if not rojo_up(port):
         kill_tree(launcher)
         die(f"rojo did not answer on {port}. log: {log}\n{log_tail(slot)}")
     forget_snapshot()
-    pid = rojo_listeners().get(port, launcher)  # the real rojo.exe, behind cmd and rokit's shim
+    pid = rojo_listeners().get(port, launcher)  # the real rojo-flow.exe, behind cmd and rokit's shim
     st = state()
     st[slot] = {"pid": pid, "port": port, "worktree": str(wt), "started": time.time()}
     save_state(st)
+    places_set(slot, sinfo, port)
 
-    print(f"setup ok, port {port}. Connect Studio ({sinfo['label']}, place {sinfo['placeId']}) to localhost:{port}.")
+    print(f"setup ok, port {port}. Studio syncs {sinfo['label']} (place {sinfo['placeId']}) by itself once it's open.")
     print(f"FLOW_UP worktree={wt} port={port} slot={slot}")
     return was and plugin_reconnects()
 
@@ -1263,6 +1226,7 @@ def cmd_down(a):
         pid = rojo_listeners().get(a.port)
         if not pid:
             die(f"no rojo is listening on port {a.port}")
+        places_drop(port=a.port)
         kill_tree(pid)
         print(f"stopped rojo on port {a.port} (pid {pid})")
         return
@@ -1343,7 +1307,9 @@ def cmd_restart(a):
         print(f"--- {slot} ({sinfo['label']})")
         (auto if serve(slot, sinfo, wt, main) else manual).append(slot)
     print()
-    if manual:
+    if manual and plugin_reconnects():
+        await_open(manual, a.quiet)
+    elif manual:
         print(f"reconnect Studio on {', '.join(manual)}")
         if not a.quiet:
             notify("flow: reconnect Studio", port_list(manual))
@@ -1388,8 +1354,10 @@ def cmd_ports(a):
         print(f"--- {n} ({cfg['slots'][n]['label']})")
         serve(n, cfg["slots"][n], wt, main_checkout())
     print()
-    print("Studio's Rojo plugin remembers the old port per place: enter the new port once in each of these places"
-          + (" (press Stop first: the plugin keeps retrying the old port)" if plugin_reconnects() else ""))
+    if plugin_reconnects():
+        print("rojo-flow's plugin looks the new ports up by itself; nothing to do in Studio")
+        return
+    print("Studio's Rojo plugin remembers the old port per place: enter the new port once in each of these places")
     for n in moves:
         print(f"  {cfg['slots'][n]['label']} (place {cfg['slots'][n]['placeId']}): localhost:{moves[n]}")
     if not a.quiet:
@@ -1810,8 +1778,10 @@ def cmd_doctor(a):
     line(running and is_stage(info["worktree"]), f"{slot} serves its stage (the flow push target)",
          f"ask the user to run `flow up {slot}` (no --tree)")
     line(running and n > 0, f"Studio ({sinfo['label']}) connected to it",
+         f"ask the user to open {sinfo['label']} in Studio (`flow open {slot}`): it syncs by itself; `flow wait` in "
+         "the background" if plugin_reconnects() else
          f"ask the user to press Connect in {sinfo['label']} (port {sinfo['port']}); `flow wait` in the background")
-    for tool in ("stylua", "rojo", "git", "blink", "rokit", "wally", "luau-lsp"):
+    for tool in ("stylua", "rojo", "rojo-flow", "git", "blink", "rokit", "wally", "luau-lsp"):
         line(shutil.which(tool) is not None, f"{tool} on PATH", "run `rokit install` in the repo")
     good, msg = setup(tree)
     line(good, msg, "fix the install error above, then doctor again")
@@ -2349,8 +2319,10 @@ def report_stamp(slot, sinfo, value, timeout=20):
     manual = (f"1. Edit datamodel, must return exactly the stamp above (else Rojo isn't synced: stop, wait for "
               f"reconnect): {stamp_luau()}")
     if not studio_connected(sinfo["port"]):
-        print(f"Studio isn't connected to {slot}: ask the user to press Connect in {sinfo['label']} (port "
-              f"{sinfo['port']}) and run `flow wait` in the background; it checks the stamp once Studio is back.")
+        ask = (f"ask the user to open {sinfo['label']} in Studio (`flow open {slot}`; it syncs by itself)"
+               if plugin_reconnects() else f"ask the user to press Connect in {sinfo['label']} (port {sinfo['port']})")
+        print(f"Studio isn't connected to {slot}: {ask} and run `flow wait` in the background; it checks the stamp "
+              "once Studio is back.")
         print("\n".join([manual] + hints))
         return
     status, sid, detail = stamp_check(sinfo["placeId"], value, timeout)
