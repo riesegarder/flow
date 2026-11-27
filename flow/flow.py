@@ -806,7 +806,7 @@ def await_reconnect(slots, quiet=False, timeout=30):
     return left
 
 
-def await_open(slots, quiet=False, timeout=8):
+def await_open(slots, quiet=False, timeout=8, hint=True):
     """Slots Studio wasn't connected to: rojo-flow's plugin syncs each one by itself once its place is open, so
     wait briefly for places that already are, and say which ones still need opening."""
     cfg = config()
@@ -819,7 +819,7 @@ def await_open(slots, quiet=False, timeout=8):
     back = [s for s in slots if s not in left]
     if back:
         print(f"Studio synced by itself: {port_list(back)}")
-    if left:
+    if left and hint:
         print("open these places in Studio (`flow open <slot>`); they sync by themselves: "
               + ", ".join(f"{s} ({cfg['slots'][s]['label']})" for s in left))
         if not quiet:
@@ -1069,10 +1069,10 @@ def cmd_up(a):
     if a.tree and len(targets) > 1:
         die("--tree serves one worktree: give one slot")
     check_origin(main_checkout())
-    up_slots(targets, tree=a.tree, base=a.base, quiet=a.quiet)
+    up_slots(targets, tree=a.tree, base=a.base, quiet=a.quiet, open_studio=not a.no_open)
 
 
-def up_slots(targets, tree=None, base="main", quiet=False):
+def up_slots(targets, tree=None, base="main", quiet=False, open_studio=True):
     cfg = config()
     main = main_checkout()
     done, auto = [], []
@@ -1102,7 +1102,9 @@ def up_slots(targets, tree=None, base="main", quiet=False):
             done.append(slot)
     print()
     if done and plugin_reconnects():
-        await_open(done, quiet)
+        left = await_open(done, quiet, hint=not open_studio)
+        if left and open_studio:
+            open_places(cfg, left)
     elif not quiet and done:
         notify("flow: connect Studio", port_list(done))
     if auto:
@@ -1708,7 +1710,7 @@ def cmd_slot(a):
         print(f"{a.name} is already served on port {s['port']}; nothing to restart")
         return
     check_origin(main_checkout())
-    up_slots([a.name], quiet=a.quiet)
+    up_slots([a.name], quiet=a.quiet, open_studio=not a.no_open)
 
 
 def cmd_register(a):
@@ -1895,15 +1897,20 @@ def cmd_open(a):
     else:
         check_slots(cfg, names)
         targets = names or [pick_slot(cfg, None)[0]]
+    open_places(cfg, targets, force=a.force)
+
+
+def open_places(cfg, targets, force=False):
+    """Open the slots' places in Studio, skipping ones a Studio already has. Returns the slots it opened."""
     try:
         with StudioMCP() as mcp:
             already = {int(s.get("placeId") or 0) for s in mcp.studios()}
     except (StudioError, OSError, ValueError):
         already = set()
-    opened = 0
+    opened = []
     for slot in targets:
         s = cfg["slots"][slot]
-        if s["placeId"] in already and not a.force:
+        if s["placeId"] in already and not force:
             print(f"{slot} {s['label']}: already open in Studio (--force opens it again)")
             continue
         try:
@@ -1917,10 +1924,16 @@ def cmd_open(a):
         if opened:
             time.sleep(2)  # one Studio launch at a time
         os.startfile(f"roblox-studio:1+launchmode:edit+task:EditPlace+placeId:{s['placeId']}+universeId:{uid}")
-        opened += 1
+        opened.append(slot)
         running = slot_report(cfg, slot)[2]
-        print(f"opening {slot} {s['label']} (place {s['placeId']}) in Studio; then connect Rojo to localhost:{s['port']}"
-              + ("" if running else f" after `flow up {slot}`"))
+        if not running:
+            after = f"; `flow up {slot}` serves it"
+        elif plugin_reconnects():
+            after = "; it syncs by itself once loaded"
+        else:
+            after = f"; then connect Rojo to localhost:{s['port']}"
+        print(f"opening {slot} {s['label']} (place {s['placeId']}) in Studio{after}")
+    return opened
 
 
 PIN_LINE = re.compile(r'^(?P<pre>[ \t]*flow[ \t]*=[ \t]*")(?P<repo>[\w.-]+/flow)@(?P<ver>[^"]+)"', re.M)
@@ -2747,6 +2760,7 @@ def main():
     s.add_argument("--tree", help="serve this worktree (.claude/worktrees/<name>) instead of the stage; push then refuses")
     s.add_argument("--base", default="main")
     s.add_argument("--all", action="store_true", help="serve every slot's stage")
+    s.add_argument("--no-open", action="store_true", help="don't open places Studio doesn't have open yet")
     s.add_argument("--quiet", action="store_true", help="no toast notification")
     s.set_defaults(fn=cmd_up)
     s = sub.add_parser("slot", help="list slots, or add/update one (saved in flow.json) and serve it")
@@ -2758,6 +2772,7 @@ def main():
     s.add_argument("--remove", action="store_true", help="remove the slot (stops its server)")
     s.add_argument("--no-up", action="store_true", help="don't serve it now")
     s.add_argument("--no-add", action="store_true", help="don't add the place to default.project.json servePlaceIds")
+    s.add_argument("--no-open", action="store_true", help="don't open the place in Studio after serving it")
     s.add_argument("--quiet", action="store_true", help="no toast notification")
     s.set_defaults(fn=cmd_slot)
     s = sub.add_parser("ports", help="renumber the slot ports from the main place port (moves running servers)")

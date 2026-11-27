@@ -80,7 +80,8 @@ flow slot                              list this machine's slots and ports
 flow slot <name> <placeId> [--label "scratch 3"] [--port N] [--here]
                                        (placeId may be a pasted roblox.com/games/<id>/... link)
                                        add/update a slot in flow.json, add the place to default.project.json
-                                       servePlaceIds, then serve it (like `flow up <name>`). --no-up: don't serve,
+                                       servePlaceIds, then serve and open it (like `flow up <name>`). --no-up: don't
+                                       serve, --no-open: serve but don't open it in Studio,
                                        --no-add: don't touch servePlaceIds, --here: only this machine uses it,
                                        --port: this machine's port for it. A running slot whose port and place
                                        didn't change keeps running.
@@ -89,16 +90,18 @@ flow ports [--dry-run]                 renumber the slot ports from the main pla
                                        slot order, skipping ports other projects or programs use); running servers
                                        move to their new port and the toast lists the new ports
 flow open [slot ...] [--all] [--force] open the slots' places in Studio (a new device: `flow open --all`); places a
-                                       Studio already has open are skipped. Asks Roblox for each place's experience id
-                                       once (cached in ~/.flow/universes.json)
+                                       Studio already has open are skipped; served ones sync by themselves once loaded.
+                                       Asks Roblox for each place's experience id once (cached in ~/.flow/universes.json)
 flow pin [version]                     pin this project's rokit.toml to the latest flow release (or that version), then
                                        `rokit install`; commit rokit.toml. flow says once a day when a newer release is
                                        out (FLOW_NO_UPDATE_CHECK=1 turns that off)
 flow register                          reserve the main place port (servePort in default.project.json)
-flow up [slot ...] [--all] [--quiet]   fetch origin and warn if local main is behind origin/main (pull first), then
+flow up [slot ...] [--all] [--no-open] [--quiet]
+                                       fetch origin and warn if local main is behind origin/main (pull first), then
                                        serve each slot's stage: setup (below), blink network.blink, rojo-flow serve, then
-                                       "setup ok, port N". Studio syncs each slot by itself once its place is open
-                                       (up waits a few seconds for places that already are).
+                                       "setup ok, port N". Studio syncs each slot by itself once its place is open: up
+                                       waits a few seconds for places that already are, then opens the others in Studio
+                                       (like `flow open`; --no-open skips that).
                                        No slot: the default one. --tree <name> serves a worktree instead of the stage
                                        (push then refuses).
 flow doctor [slot]                     (sessions) claim a free slot (connected Studios first) + preflight + setup of the
