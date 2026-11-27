@@ -9,7 +9,10 @@ permissions:
 
 jobs:
   build:
-    runs-on: windows-latest
+    strategy:
+      matrix:
+        os: [windows-latest, ubuntu-latest, macos-latest]
+    runs-on: ${{ matrix.os }}
     steps:
       - uses: actions/checkout@v5
       - uses: actions/setup-python@v6
@@ -22,9 +25,24 @@ jobs:
           v=$(sed -n 's/^VERSION = "\(.*\)"/\1/p' flow/flow.py)
           [ "v$v" = "$GITHUB_REF_NAME" ] || { echo "tag $GITHUB_REF_NAME but VERSION is $v"; exit 1; }
       - run: python build.py
-      - run: dist/flow.exe --version
-      - name: release
+      - name: smoke test
         shell: bash
+        run: |
+          if [ -f dist/flow.exe ]; then dist/flow.exe --version; else dist/flow --version; fi
+      - uses: actions/upload-artifact@v4
+        with:
+          name: flow-${{ matrix.os }}
+          path: dist/flow-*.zip
+
+  release:
+    needs: build
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          path: dist
+          merge-multiple: true
+      - name: release
         env:
           GH_TOKEN: ${{ github.token }}
-        run: gh release create "$GITHUB_REF_NAME" dist/flow-*.zip --title "$GITHUB_REF_NAME" --generate-notes
+        run: gh release create "$GITHUB_REF_NAME" dist/flow-*.zip --repo "$GITHUB_REPOSITORY" --title "$GITHUB_REF_NAME" --generate-notes

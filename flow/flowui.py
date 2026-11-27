@@ -50,43 +50,156 @@ def prefix(stream=None):
 
 
 # ---------------------------------------------------------------- decorated output
+#
+# Every line gets a style from what it says (fmt), and the values people look for stand out inside it
+# (hl): ports bold orange, slot names bold cyan, the stamp bold magenta, studio_ids magenta, place ids blue,
+# commands in backticks teal, paths gray.
 
 OK_PREFIXES = ("setup ok", "setup:", "pushed ", "claimed ", "stopped ", "blink:", "released", "deleted ",
-               "done.", "main place port", "this tree", "Studio connected", "slot ")
+               "done.", "main place port", "this tree", "Studio connected", "saved ", "added ", "removed ",
+               "stage:", "stage created", "worktree created", "worktree exists", "pinned ", "opening ",
+               "rokit install: done", "Studio synced", "Studio has ", "Studio reconnected", "local main has everything",
+               "local main already", "local main fast-forwarded", "rebased ", "branch has everything", "slot ports already")
+WARNISH = ("Studio isn't", "Ask the user", "reconnect Studio", "WARNING", "Studio's Rojo plugin")
+GRAYISH = ("(", "FLOW_UP", "not covered", "type check", "state:", "sessions ", "dry run")
 STATUS = re.compile(r"^(\S+) (.*?) port (\d+) place (\d+): (.*)$")
+SLOT_LINE = re.compile(r"^(\S+) (.*?) port (\d+) place (\d+)( \(default\))?$")
+PORTS_LINE = re.compile(r"^(\S+) (.*?): port (\d+)( -> \d+| \(unchanged\))$")
+FINDING = re.compile(r"^(ERROR|WARN)\s+(\S*?)(:\d+)?\s+\[([^\]]+)\]\s+(.*)$")
+DOCTOR = re.compile(r"^(ok  |FAIL) (.*?)(  -> (.*))?$")
+TOKENS = re.compile(
+    r"(?P<cmd>`[^`]+`)"
+    r"|(?P<uuid>\b[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}\b)"
+    r"|(?P<stamp>(?<![\w.-])[\w.-]+@[0-9a-f]{7,}(?:\+dirty)?:[0-9a-f]{6}\b)"
+    r"|(?P<port>(?:(?<=port )|(?<=port=)|(?<=localhost:)|(?<=-> )|(?<=\[))\d{4,5}(?![\w:-])(?!\.\d))"
+    r"|(?P<place>(?:(?<=place )|(?<=placeId )|(?<=place=)|(?<=place\(s\) ))\d{5,}\b)"
+    r"|(?P<path>\b[A-Za-z]:\\[^\s,;:)]*)")
+SLOT_NAMES = set()  # flow fills this with the project's slot names, so they stand out wherever they appear
+_TOKENS = {}
+
+
+def tokens():
+    key = tuple(sorted(SLOT_NAMES))
+    if key not in _TOKENS:
+        names = "|".join(re.escape(n) for n in sorted(key, key=len, reverse=True))
+        extra = rf"|(?P<slot>(?<![\w/\\.@-])(?:{names})(?![\w/\\@-])(?!\.\w))" if names else ""
+        _TOKENS[key] = re.compile(TOKENS.pattern + extra)
+    return _TOKENS[key]
+
+
+TOKEN_STYLE = {"slot": ("bold", "cyan"), "cmd": ("teal",), "uuid": ("magenta",), "stamp": ("bold", "magenta"), "port": ("bold", "orange"),
+               "place": ("blue",), "path": ("gray",)}
+
+
+def sgr(*styles):
+    return "\x1b[" + ";".join(SGR[s] for s in styles) + "m" if styles else ""
+
+
+def hl(text, *base):
+    """text in the base style, with ports, stamps, ids, commands and paths highlighted in it. Assumes color."""
+    _vt_once()
+    out, pos, b = [], 0, sgr(*base)
+    for m in tokens().finditer(text):
+        out.append(text[pos:m.start()])
+        out.append("\x1b[0m" + sgr(*TOKEN_STYLE[m.lastgroup]) + m.group(0) + "\x1b[0m" + b)
+        pos = m.end()
+    out.append(text[pos:])
+    body = "".join(out)
+    return (b + body + "\x1b[0m") if b else body
+
+
+def slot_head(slot, label, port, place):
+    return (paint(slot, "bold", "cyan") + " " + label + paint(" port ", "gray") + paint(port, "bold", "orange")
+            + paint(" place ", "gray") + paint(place, "blue"))
 
 
 def fmt(line):
-    """Color one output line by what it says. Unknown lines stay as they are."""
+    """Color one output line by what it says, highlighting the values in it."""
     if not use_color() or not line.strip():
         return line
     s = line.rstrip("\n")
+    m = FINDING.match(s)
+    if m:
+        sev, path, ln, rule, msg = m.groups()
+        bad = sev == "ERROR"
+        mark = paint("✗", "bold", "red") if bad else paint("!", "bold", "yellow")
+        where = (paint(path, "bold") + paint(ln or "", "gray") + " ") if path else ""
+        return f"{mark} {where}{paint('[' + rule + ']', 'red' if bad else 'yellow')} {hl(msg)}"
     if s.startswith(("WARNING", "WARN ")):
-        return paint("! " + s, "yellow")
-    if s.startswith("ERROR "):
-        return paint("✗", "red") + " " + paint(s[6:], "red")
+        return paint("!", "bold", "yellow") + " " + hl(s, "yellow")
+    if s.startswith("ERROR ") or s.lstrip().startswith("[ERROR"):
+        return hl(s, "red")
     m = STATUS.match(s)
     if m:
         slot, label, port, place, rest = m.groups()
-        rest = (rest.replace("NO Studio connected", paint("NO Studio connected", "yellow"))
-                .replace("Studio connected", paint("Studio connected", "green"))
-                .replace("not running", paint("not running", "gray")))
-        if rest.startswith("running"):
-            rest = paint("running", "green") + rest[7:]
-        return (paint(slot, "bold", "cyan") + " " + label + paint(f" port {port} place {place}", "gray") + ": " + rest)
+        parts = []
+        for piece in rest.split(", "):
+            if piece == "running":
+                piece = paint(piece, "green")
+            elif piece == "NO Studio connected":
+                piece = paint(piece, "bold", "yellow")
+            elif piece == "Studio connected":
+                piece = paint(piece, "green")
+            elif piece == "free":
+                piece = paint(piece, "green")
+            elif piece.startswith("not running"):
+                piece = paint("not running", "gray") + hl(piece[11:])
+            elif piece.startswith("held by "):
+                piece = paint("held by ", "gray") + paint(piece[8:].split(" (")[0], "bold") + paint(
+                    piece[8 + len(piece[8:].split(" (")[0]):], "gray")
+            elif piece.startswith("Rojo crashed"):
+                piece = hl(piece, "red")
+            elif piece.startswith("tree "):
+                piece = paint("tree ", "gray") + piece[5:]
+            else:
+                piece = hl(piece)
+            parts.append(piece)
+        return slot_head(slot, label, port, place) + ": " + ", ".join(parts)
+    m = SLOT_LINE.match(s)
+    if m:
+        slot, label, port, place, default = m.groups()
+        return slot_head(slot, label, port, place) + (paint(default, "green") if default else "")
+    m = PORTS_LINE.match(s)
+    if m:
+        slot, label, port, change = m.groups()
+        head = paint(slot, "bold", "cyan") + " " + label + paint(": port ", "gray")
+        if change.startswith(" ->"):
+            return head + paint(port, "gray") + paint(" -> ", "gray") + paint(change[4:], "bold", "orange")
+        return head + paint(port, "bold", "orange") + paint(change, "gray")
+    m = DOCTOR.match(s)
+    if m:
+        state, msg, _, fix = m.groups()
+        if state == "FAIL":
+            return (paint("✗ FAIL", "bold", "red") + " " + hl(msg) + (paint("  → ", "gray") + hl(fix, "yellow")
+                                                                     if fix else ""))
+        return paint("✓ ok  ", "green") + " " + hl(msg)
+    m = re.match(r"^--- (\S+)( \(.*\))?$", s)
+    if m:
+        return paint("─── ", "gray") + paint(m.group(1), "bold", "cyan") + (m.group(2) or "")
     m = re.match(r"^checked (.*): (\d+) errors?, (\d+) warnings?$", s)
     if m:
-        bad = int(m.group(2)) > 0
-        return paint("✗" if bad else "✓", "red" if bad else "green") + " " + paint(s, "red" if bad else "green")
+        bad, warn = int(m.group(2)) > 0, int(m.group(3)) > 0
+        color = "red" if bad else ("yellow" if warn else "green")
+        return (paint("✗" if bad else "✓", "bold", color) + " " + paint(f"checked {m.group(1)}: ", color)
+                + paint(f"{m.group(2)} error{'s' * (m.group(2) != '1')}", "bold", "red" if bad else "green") + paint(", ", color)
+                + paint(f"{m.group(3)} warning{'s' * (m.group(3) != '1')}", "bold", "yellow" if warn else "green"))
+    if TOKENS.fullmatch(s.strip()) and TOKENS.fullmatch(s.strip()).lastgroup == "stamp":
+        return hl(s)
     if s.startswith(OK_PREFIXES):
-        return paint("✓", "green") + " " + s
+        return paint("✓", "green") + " " + hl(s)
+    if s.startswith(WARNISH):
+        return paint("!", "bold", "yellow") + " " + hl(s, "yellow")
     if s.startswith(("next:", "note:")):
-        return paint(s, "cyan")
-    if s.startswith(("(", "FLOW_UP", "not covered", "type check")):
-        return paint(s, "gray")
+        return hl(s, "cyan")
+    if s.startswith(("use studio_id", "studio_id=", "no studio_id", "when the session")):
+        return hl(s, "gray") if s.startswith("when") else paint("→ ", "magenta") + hl(s)
+    if s.startswith("slot=") and " port=" in s:
+        return re.sub(r"(\w+)=", lambda k: paint(k.group(1) + "=", "gray"), hl(s))
+    if s.startswith(GRAYISH):
+        return hl(s, "gray")
     if re.match(r"^\d+\. ", s):
-        return paint(s, "yellow")
-    return line
+        return paint(s[:s.index(" ")], "bold", "yellow") + " " + hl(s[s.index(" ") + 1:], "yellow")
+    return hl(s)
 
 
 def say(*args, **kwargs):

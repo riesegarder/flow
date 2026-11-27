@@ -4,23 +4,31 @@
   One scratch place (slot) per session. Each slot has its own stage worktree served by its own rojo;
   a session claims a free slot and pushes its own worktree onto that slot's stage.
 
-  flow slot <name> <placeId>   (user) add a scratch place as a slot
-  flow up [--slot s|--all]     (user) serve the slot's stage; connect that Studio once
-  flow doctor                  (session) claim a free slot + preflight
-  flow push                    (session) mirror this worktree onto its slot's stage + stamp
+  flow slot <name> <placeId>   (user) add a scratch place as a slot (saved in flow.json) and serve it
+  flow up [slot ...|--all]     (user) serve the slots' stages; connect each Studio once
+  flow open [slot ...|--all]   (user) open the slots' places in Studio
+  flow ports                   (user) renumber the slot ports from the main place port
+  flow pin [version]           (user) pin this project's rokit.toml to the latest (or given) flow
+  flow doctor [slot]           (session) claim a free slot + preflight
+  flow push                    (session) mirror this worktree onto its slot's stage, stamp, check Studio has it
+  flow verify                  (session) check Studio has the last stamp
   flow release                 (session) free the slot when done
-  flow status / where / wait / prune / check
+  flow status / where / wait / log / port / prune / check
 """
 import argparse
 import contextlib
 import hashlib
 import json
 import os
+import platform
+import queue
 import re
 import shutil
+import struct
 import subprocess
 import sys
 import tempfile
+import threading
 import time
 import urllib.request
 from pathlib import Path
@@ -30,49 +38,51 @@ from flowui import busy
 
 print = flowui.say  # colored output, plain when piped
 
-VERSION = "1.1.3"
+VERSION = "1.2.0"
+WINDOWS = os.name == "nt"
+NO_WINDOW = 0x08000000 if WINDOWS else 0  # CREATE_NO_WINDOW: no subprocess ever pops up a console window
 
-if getattr(sys, "frozen", False) and os.name == "nt":
+if getattr(sys, "frozen", False) and WINDOWS:
     # the PyInstaller exe points the DLL search at its temp folder; rojo would inherit that, load its runtime
     # DLLs from there and keep the folder from being deleted when flow exits
     import ctypes
 
     ctypes.windll.kernel32.SetDllDirectoryW(None)
 
+if hasattr(sys.stdout, "reconfigure"):
+    sys.stdout.reconfigure(encoding="utf-8", errors="replace")
+
+
+def git_out(args, cwd=None):
+    p = subprocess.run(["git"] + args, cwd=cwd, capture_output=True, text=True, encoding="utf-8", errors="replace",
+                       creationflags=NO_WINDOW)
+    return p.stdout.strip() if p.returncode == 0 else ""
+
+
 def project_key():
-    """Folder name of the main checkout, so every project keeps its own slots and leases."""
-    p = subprocess.run(["git", "worktree", "list", "--porcelain"], capture_output=True, text=True)
-    first = next((l[9:] for l in p.stdout.splitlines() if l.startswith("worktree ")), "")
+    """Folder name of the main checkout: the name of the state folder flow <= 1.1 used."""
+    out = git_out(["worktree", "list", "--porcelain"])
+    first = next((l[9:] for l in out.splitlines() if l.startswith("worktree ")), "")
     return re.sub(r"[^\w.-]", "_", Path(first).name) if first else "default"
 
 
-_BASE = Path(os.environ.get("LOCALAPPDATA") or Path.home()) / "flow"  # per-machine state, not in git
-# FLOW_HOME is not read at all: older per-project flow copies set it user-wide (it made projects share state,
-# and counting its slots as another project's made a migrated project hand out new ports to itself).
-HERE = Path(os.environ["FLOW_STATE_DIR"]) if os.environ.get("FLOW_STATE_DIR") else _BASE / project_key()
-FLOW_ROOT = _BASE  # every project's folder sits here
-HERE.mkdir(parents=True, exist_ok=True)
-CONFIG = HERE / "config.json"
-STATE = HERE / "state.json"
-LEASES = HERE / "leases.json"
-NO_WINDOW = 0x08000000
+# This machine's state for a project lives in the repo's git folder (.git/flow): per project, shared by every
+# worktree, never committed. Not in %LOCALAPPDATA% like flow <= 1.1: the Claude desktop app is a packaged app,
+# and Windows gives everything it starts a private copy of %LOCALAPPDATA%, so flow run by sessions and flow run
+# in a normal terminal read and wrote two different state files (a server "not running" with a dead pid).
+_COMMON = git_out(["rev-parse", "--path-format=absolute", "--git-common-dir"])
+if os.environ.get("FLOW_STATE_DIR"):
+    HERE = Path(os.environ["FLOW_STATE_DIR"])
+elif _COMMON:
+    HERE = Path(_COMMON) / "flow"
+else:
+    HERE = Path.home() / ".flow" / "no-repo"
+LEGACY_ROOT = Path(os.environ.get("LOCALAPPDATA") or Path.home()) / "flow"  # flow <= 1.1 kept its state here
+REGISTRY = Path.home() / ".flow" / "ports.json"  # machine-wide: the ports every project uses
+STATE = HERE / "state.json"  # running servers: {slot: {pid, port, worktree, started}}
+LEASES = HERE / "leases.json"  # which session holds which slot
+LOCAL = HERE / "machine.json"  # this machine's slot ports, default slot, machine-only slots
 LEASE_HOURS = 8  # a lease nobody pushed under for this long is free again
-
-
-def stage_name(slot):
-    return f"flow-{slot}"
-
-
-def is_stage(path):
-    name = Path(path).name
-    return name == "flow-stage" or (name.startswith("flow-") and name[5:] in config()["slots"])
-
-# Empty on purpose: every machine adds its own scratch places (`flow slot s3 <placeId>`), so two
-# devices never serve or claim the same place.
-DEFAULT_CONFIG = {"default": None, "slots": {}}
-
-if hasattr(sys.stdout, "reconfigure"):
-    sys.stdout.reconfigure(encoding="utf-8", errors="replace")
 
 
 def run(cmd, cwd=None, check=False, label=None):
@@ -86,75 +96,152 @@ def run(cmd, cwd=None, check=False, label=None):
 
 
 def die(msg, code=1):
-    sys.stderr.write(f"{flowui.prefix(sys.stderr)} {msg}\n")
+    sys.stdout.flush()  # what was printed before comes first, also when piped
+    body = flowui.hl(msg) if flowui.use_color(sys.stderr) else msg
+    sys.stderr.write(f"{flowui.prefix(sys.stderr)} {body}\n")
     sys.exit(code)
 
 
-def load_json(path, default):
-    if path.exists():
-        return json.loads(path.read_text(encoding="utf-8"))
-    return default
+def is_agent():
+    # isatty() can't tell (Windows reports NUL as a tty); agent shells carry these variables
+    return any(os.environ.get(k) for k in ("CLAUDECODE", "AI_AGENT")) and not os.environ.get("FLOW_ALLOW_AGENT")
 
 
-def config():
-    if not CONFIG.exists():
-        CONFIG.write_text(json.dumps(DEFAULT_CONFIG, indent=2), encoding="utf-8")
-    return load_json(CONFIG, DEFAULT_CONFIG)
+def user_only(cmd):
+    # Starting or stopping a server forces the user to reconnect Studio, so agents may not.
+    if is_agent():
+        die(f"`flow {cmd}` is a manual command for the user. Agents: don't start or stop servers or change slots; "
+            "use `flow where` / `flow status`, and if nothing is served ask the user to run `flow up <slot>`.", 4)
 
 
-def main_port():
-    """The port of the main place: servePort in the main checkout's default.project.json."""
-    return load_json(main_checkout() / "default.project.json", {}).get("servePort", 34872)
+# ---------------------------------------------------------------- files
+
+def load_json(path, default, strict=False):
+    """A JSON file, or default when it doesn't exist. A BOM is fine (PowerShell 5.1 writes one). A broken state
+    file is reported and treated as missing; a broken settings file (strict) stops flow."""
+    try:
+        text = Path(path).read_text(encoding="utf-8-sig")
+    except FileNotFoundError:
+        return default
+    try:
+        return json.loads(text)
+    except ValueError as e:
+        if strict:
+            die(f"can't read {path}: {e}")
+        print(f"WARNING: {path} is not valid JSON ({e}); ignoring it")
+        return default
 
 
-def other_ports():
-    """Ports claimed by other projects on this machine (their main place and their slots)."""
-    mine = CONFIG.resolve()
-    used = set()
-    for path in FLOW_ROOT.glob("*/config.json"):
-        if not path.exists() or path.resolve() == mine:
-            continue
-        c = load_json(path, {})
-        used.update(s.get("port", 0) for s in c.get("slots", {}).values())
-        used.add(c.get("mainPort", 0))
-    used.discard(0)
-    return used
+def write_json(path, data):
+    path = Path(path)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    tmp = path.with_name(path.name + ".tmp")
+    tmp.write_text(json.dumps(data, indent=2), encoding="utf-8")
+    os.replace(tmp, path)
 
 
-def cmd_register(a):
-    """Reserve this project's main-place port (servePort) so no slot, here or in another project, shares it.
-    Keeps the current servePort when nobody uses it, else moves it to the next free port."""
-    cfg = config()
-    path = main_checkout() / "default.project.json"
-    text = path.read_text(encoding="utf-8")
-    cur = main_port()
-    taken = other_ports() | {s["port"] for s in cfg["slots"].values()}
-    port = cur
-    if cur in taken:
-        port = max(taken | {cur, 37844}) + 1
-        text = re.sub(r'("servePort"\s*:\s*)\d+', rf"\g<1>{port}", text, count=1)
-        path.write_text(text, encoding="utf-8")
-        print(f"servePort {cur} is already used: changed default.project.json to {port}")
-    cfg["mainPort"] = port
-    CONFIG.write_text(json.dumps(cfg, indent=2), encoding="utf-8")
-    print(f"main place port {port}")
+def read_raw(path):
+    with open(path, encoding="utf-8-sig", newline="") as f:  # keeps the file's own line endings
+        return f.read()
 
 
-def state():
-    return load_json(STATE, {})
+def write_raw(path, text):
+    with open(path, "w", encoding="utf-8", newline="") as f:
+        f.write(text)
 
 
-def save_state(s):
-    STATE.write_text(json.dumps(s, indent=2), encoding="utf-8")
+_WS = re.compile(r"\s*")
+
+
+def json_members(text):
+    """[(key, start, end)] of the top-level members of the JSON object in text (spans of their values), so a
+    file can be edited without reformatting the rest of it."""
+    dec = json.JSONDecoder()
+    i = _WS.match(text, text.index("{") + 1).end()
+    out = []
+    while text[i] != "}":
+        key, i = json.decoder.scanstring(text, i + 1)
+        i = _WS.match(text, _WS.match(text, i).end() + 1).end()  # past the colon
+        _, end = dec.raw_decode(text, i)
+        out.append((key, i, end))
+        i = _WS.match(text, end).end()
+        if text[i] == ",":
+            i = _WS.match(text, i + 1).end()
+    return out
+
+
+def newline_of(text):
+    return "\r\n" if "\r\n" in text else "\n"
+
+
+def indent_of(text):
+    m = re.search(r"\n([ \t]+)\"", text)
+    return m.group(1) if m else "\t"
+
+
+def set_member(text, key, value):
+    """text with its top-level member `key` set to the JSON text `value`: replaced in place, else appended."""
+    members = json_members(text)
+    for k, s, e in members:
+        if k == key:
+            return text[:s] + value + text[e:]
+    nl, ind = newline_of(text), indent_of(text)
+    if members:
+        end = members[-1][2]
+        return text[:end] + f",{nl}{ind}{json.dumps(key)}: {value}" + text[end:]
+    close = text.rindex("}")
+    return text[:close].rstrip() + f"{nl}{ind}{json.dumps(key)}: {value}{nl}" + text[close:]
+
+
+def add_place_ids_text(text, ids):
+    """(text with the ids appended to servePlaceIds, keeping the file's formatting, [the ids that were added])."""
+    have = json.loads(text).get("servePlaceIds")
+    missing = [i for i in dict.fromkeys(ids) if i not in (have if isinstance(have, list) else [])]
+    if not missing:
+        return text, []
+    if not isinstance(have, list):
+        return set_member(text, "servePlaceIds", "[" + ", ".join(map(str, missing)) + "]"), missing
+    s, e = next((s, e) for k, s, e in json_members(text) if k == "servePlaceIds")
+    arr = text[s:e]
+    k = len(arr[:-1].rstrip())  # just after the last item
+    if k <= 1:
+        new = "[" + ", ".join(map(str, missing)) + "]"
+    elif "\n" in arr:
+        ind = re.match(r"[ \t]*", arr[arr.rfind("\n", 0, k) + 1:]).group()
+        new = arr[:k] + "".join(f",{newline_of(text)}{ind}{i}" for i in missing) + arr[k:]
+    else:
+        new = arr[:k] + "".join(f", {i}" for i in missing) + arr[k:]
+    return text[:s] + new + text[e:], missing
+
+
+def add_place_ids(path, ids):
+    if not Path(path).exists():
+        return []
+    text = read_raw(path)
+    new, added = add_place_ids_text(text, ids)
+    if added:
+        write_raw(path, new)
+    return added
+
+
+# ---------------------------------------------------------------- repo
+
+_MAIN = None
 
 
 def main_checkout(cwd=None):
+    global _MAIN
+    if cwd is None and _MAIN:
+        return _MAIN
     p = run(["git", "worktree", "list", "--porcelain"], cwd=cwd)
     if p.returncode != 0:
         die("not inside a git repo")
     for line in p.stdout.splitlines():
         if line.startswith("worktree "):
-            return Path(line[9:])
+            path = Path(line[9:])
+            if cwd is None:
+                _MAIN = path
+            return path
     die("no worktree found")
 
 
@@ -163,6 +250,23 @@ def toplevel(cwd=None):
     if p.returncode != 0:
         die("not inside a git repo")
     return Path(p.stdout.strip())
+
+
+def same_path(a, b):
+    return os.path.normcase(os.path.abspath(str(a))) == os.path.normcase(os.path.abspath(str(b)))
+
+
+def stage_name(slot):
+    return f"flow-{slot}"
+
+
+def stage_path(slot):
+    return main_checkout() / ".claude" / "worktrees" / stage_name(slot)
+
+
+def is_stage(path):
+    name = Path(path).name
+    return name == "flow-stage" or (name.startswith("flow-") and name[5:] in config()["slots"])
 
 
 def count(tree, rng):
@@ -201,12 +305,15 @@ def own_commits(tree):
 
 
 def notify(title, msg):
+    if not WINDOWS:
+        return
+    q = lambda s: "'" + str(s).replace("'", "''") + "'"  # noqa: E731  (a label with an apostrophe broke the toast)
     ps = (
         "[Windows.UI.Notifications.ToastNotificationManager, Windows.UI.Notifications, ContentType=WindowsRuntime] | Out-Null;"
         "$t=[Windows.UI.Notifications.ToastNotificationManager]::GetTemplateContent('ToastText02');"
         "$n=$t.GetElementsByTagName('text');"
-        f"$n.Item(0).AppendChild($t.CreateTextNode('{title}')) | Out-Null;"
-        f"$n.Item(1).AppendChild($t.CreateTextNode('{msg}')) | Out-Null;"
+        f"$n.Item(0).AppendChild($t.CreateTextNode({q(title)})) | Out-Null;"
+        f"$n.Item(1).AppendChild($t.CreateTextNode({q(msg)})) | Out-Null;"
         "$app='{1AC14E77-02E7-4E5D-B744-2EB1AE5198B7}\\WindowsPowerShell\\v1.0\\powershell.exe';"
         "[Windows.UI.Notifications.ToastNotificationManager]::CreateToastNotifier($app).Show([Windows.UI.Notifications.ToastNotification]::new($t))"
     )
@@ -217,12 +324,268 @@ def notify(title, msg):
         pass
 
 
+# ---------------------------------------------------------------- project settings (flow.json)
+
+PROJECT_DEFAULTS = {
+    "stamp": {
+        "file": "src/Modules/Shared/FlowStamp.txt",
+        "instance": "ReplicatedStorage.Source.Modules.SharedModules.FlowStamp",
+    },
+    "generated": ["Packages/", "ServerPackages/", "DevPackages/", "sourcemap.json", "BlinkClient.luau", "BlinkServer.luau"],
+    "builtin": {"output": "error", "unused": "error", "const": "warn", "server-only": "warn"},
+    "ignore": [".lune/**"],
+    "reservedPorts": [],
+    "rules": [],
+    "checks": [],
+    "commands": {},
+}
+_PROJECT = None
+
+
+def project_file():
+    root = main_checkout()
+    for name in ("flow.json", "flow.rules.json"):
+        if (root / name).exists():
+            return root / name
+    return root / "flow.json"
+
+
+def project():
+    """The project's settings: flow.json in the main checkout over PROJECT_DEFAULTS (one level deep).
+    flow.rules.json is read instead when there is no flow.json."""
+    global _PROJECT
+    if _PROJECT is not None:
+        return _PROJECT
+    cfg = json.loads(json.dumps(PROJECT_DEFAULTS))
+    path = project_file()
+    if path.exists():
+        raw = load_json(path, {}, strict=True)
+        for k, v in raw.items():
+            cfg[k] = {**cfg[k], **v} if isinstance(cfg.get(k), dict) and isinstance(v, dict) else v
+        cfg["_file"] = path.name
+    _PROJECT = cfg
+    return cfg
+
+
+def save_slots(slots):
+    """Write the slots into the project's flow.json (main checkout), leaving the rest of the file as it is."""
+    global _PROJECT, _CFG
+    path = project_file()
+    text = read_raw(path) if path.exists() else "{\n}\n"
+    nl, ind = newline_of(text), indent_of(text)
+    if slots:
+        body = f",{nl}".join(f"{ind}{ind}{json.dumps(n)}: {json.dumps(s)}" for n, s in slots.items())
+        value = "{" + nl + body + nl + ind + "}"
+    else:
+        value = "{}"
+    write_raw(path, set_member(text, "slots", value))
+    _PROJECT = _CFG = None
+
+
+# ---------------------------------------------------------------- slots and ports
+
+def host():
+    return (os.environ.get("COMPUTERNAME") or platform.node() or "?").upper()
+
+
+def local():
+    m = load_json(LOCAL, {})
+    m.setdefault("ports", {})
+    return m
+
+
+def save_local(m):
+    global _CFG
+    write_json(LOCAL, m)
+    _CFG = None
+
+
+def migrate():
+    """First run of 1.2 in a project: take over this machine's slots, ports and leases from flow <= 1.1."""
+    if LOCAL.exists() or not _COMMON:
+        return
+    old = LEGACY_ROOT / project_key()
+    cfg = load_json(old / "config.json", {})
+    slots = cfg.get("slots") or {}
+    m = {"ports": {n: s["port"] for n, s in slots.items() if s.get("port")}, "default": cfg.get("default")}
+    if slots:
+        m["legacySlots"] = {n: {"placeId": s["placeId"], "label": s.get("label") or n} for n, s in slots.items()}
+        for name in ("state.json", "leases.json"):
+            data = load_json(old / name, None)
+            if data and not (HERE / name).exists():
+                write_json(HERE / name, data)
+        print(f"note: flow 1.2 keeps this machine's state in {HERE}; took over the slots, ports and leases from {old}")
+    save_local(m)
+
+
+def adopt_slots():
+    """Save slots that only this machine knew (flow <= 1.1) in flow.json, so every device gets them."""
+    m = local()
+    legacy = m.get("legacySlots")
+    if not legacy or is_agent():
+        return
+    shared = dict(project().get("slots") or {})
+    added, clash = [], {}
+    for n, s in legacy.items():
+        cur = shared.get(n)
+        if cur is None:
+            shared[n] = s
+            added.append(n)
+        elif int(cur.get("placeId", 0)) != int(s["placeId"]):
+            clash[n] = s
+    if added:
+        save_slots(shared)
+        print(f"note: saved this machine's slots {', '.join(added)} in {project_file().name}: commit it so other "
+              "devices get them")
+    m = local()
+    if clash:
+        m.setdefault("slots", {}).update(clash)
+        print(f"WARNING: {', '.join(clash)} use other places in {project_file().name}; this machine keeps its own "
+              f"(in {LOCAL}). Give them other names with `flow slot <name> <placeId>` to share them.")
+    m.pop("legacySlots", None)
+    save_local(m)
+
+
+def slot_defs():
+    """{name: {placeId, label}} of the slots on this machine, in order: flow.json's (shared by every device; a
+    slot with "hosts" only on those machines), then this machine's own."""
+    out = {}
+    for name, s in (project().get("slots") or {}).items():
+        hosts = [h.upper() for h in s.get("hosts", [])]
+        if not hosts or host() in hosts:
+            out[name] = {"placeId": int(s["placeId"]), "label": s.get("label") or name}
+    m = local()
+    for name, s in (m.get("slots") or m.get("legacySlots") or {}).items():
+        out[name] = {"placeId": int(s["placeId"]), "label": s.get("label") or name}
+    return out
+
+
+def main_port():
+    """The port of the main place: servePort in the main checkout's default.project.json."""
+    return load_json(main_checkout() / "default.project.json", {}).get("servePort", 34872)
+
+
+_OTHER = None
+
+
+def other_ports():
+    """Ports slots must not get: other projects' on this machine (their main place and their slots), and the
+    project's own reservedPorts (flow.json: ports its other tools listen on)."""
+    global _OTHER
+    if _OTHER is not None:
+        return _OTHER
+    mine = os.path.normcase(str(main_checkout()))
+    used, names = {int(p) for p in project().get("reservedPorts") or []}, set()
+    for path, e in load_json(REGISTRY, {}).items():
+        if os.path.normcase(path) == mine or not Path(path).exists():
+            continue
+        names.add(re.sub(r"[^\w.-]", "_", Path(path).name))
+        used.add(e.get("main", 0))
+        used.update(e.get("slots", {}).values())
+    for path in LEGACY_ROOT.glob("*/config.json"):  # projects still on flow <= 1.1
+        if path.parent.name in names or path.parent.name == project_key():
+            continue
+        c = load_json(path, {})
+        used.update(s.get("port", 0) for s in c.get("slots", {}).values())
+        used.add(c.get("mainPort", 0))
+    used.discard(0)
+    used.discard(None)
+    _OTHER = used
+    return used
+
+
+def note_ports(slots):
+    """Record this project's ports machine-wide, so no other project hands them out."""
+    reg = load_json(REGISTRY, {})
+    gone = [p for p in reg if not Path(p).exists()]
+    for p in gone:
+        reg.pop(p)
+    key = str(main_checkout())
+    entry = {"main": main_port(), "slots": slots}
+    if gone or reg.get(key) != entry:
+        reg[key] = entry
+        write_json(REGISTRY, reg)
+
+
+_CFG = None
+
+
+def config():
+    """{"slots": {name: {placeId, label, port}}, "default": name} for this machine. A slot without a port gets
+    the main place port + its position, or the next free port after that."""
+    global _CFG
+    if _CFG is None:
+        defs = slot_defs()
+        m = local()
+        ports = m["ports"]
+        used = other_ports() | {main_port()}
+        changed = False
+        for i, n in enumerate(defs, 1):
+            if n not in ports:
+                p = main_port() + i
+                while p in used or p in ports.values():
+                    p += 1
+                ports[n] = p
+                changed = True
+        if changed:
+            write_json(LOCAL, m)
+        note_ports({n: ports[n] for n in defs})
+        default = m.get("default") if m.get("default") in defs else next(iter(defs), None)
+        _CFG = {"slots": {n: {**d, "port": ports[n]} for n, d in defs.items()}, "default": default}
+        flowui.SLOT_NAMES = set(defs)
+    return _CFG
+
+
+def reconfig():
+    global _CFG
+    _CFG = None
+    return config()
+
+
+def pick_slot(cfg, name):
+    if not cfg["slots"]:
+        die(f"no slots on this machine yet. add one: flow slot <name> <placeId>  (saved in {project_file().name})")
+    slot = name or cfg["default"] or next(iter(cfg["slots"]))
+    if slot not in cfg["slots"]:
+        die(f"unknown slot '{slot}'. slots: {', '.join(cfg['slots'])}")
+    return slot, cfg["slots"][slot]
+
+
+def check_slots(cfg, names):
+    for n in names:
+        if n not in cfg["slots"]:
+            tree = main_checkout() / ".claude" / "worktrees" / n
+            hint = f" To serve the worktree {n} instead of a stage: flow up <slot> --tree {n}" if tree.exists() else ""
+            known = ", ".join(cfg["slots"]) or "none yet (flow slot <name> <placeId>)"
+            die(f"unknown slot '{n}'. slots: {known}.{hint}")
+
+
+def slot_args(a):
+    names = list(getattr(a, "slots", None) or [])
+    for k in ("slot", "slot_pos"):
+        if getattr(a, k, None):
+            names.append(getattr(a, k))
+    return list(dict.fromkeys(names))
+
+
+def one_slot(a):
+    names = slot_args(a)
+    if len(names) > 1:
+        die(f"give one slot, not {', '.join(names)}")
+    return names[0] if names else None
+
+
+def port_list(slots):
+    cfg = config()
+    return ", ".join(f"{s} [{cfg['slots'][s]['port']}]" for s in slots)
+
+
 # ---------------------------------------------------------------- servers
 
 def in_job():
     """True when this process runs inside a Windows job object. rokit runs every tool in a job that is killed
     when the tool exits, which would take any server started from here down with it."""
-    if os.name != "nt":
+    if not WINDOWS:
         return False
     import ctypes
 
@@ -234,9 +597,10 @@ def in_job():
 
 
 def spawn_detached(cmd, cwd, log):
-    """Start a long-lived server writing to log and return its pid. Outside a job a plain Popen is enough;
-    inside one (rokit) the process is created by WMI instead, so it is not part of the job and outlives flow.
-    The WMI process gets the user's normal environment, not this one."""
+    """Start a long-lived server writing to log and return its (launcher) pid. Outside a job a plain Popen is
+    enough; inside one (rokit) the process is created by WMI instead, so it is not part of the job and outlives
+    flow. The WMI process gets the user's normal environment, not this one."""
+    Path(log).parent.mkdir(parents=True, exist_ok=True)
     if not in_job():
         with open(log, "w") as lf:
             return subprocess.Popen(cmd, cwd=cwd, stdout=lf, stderr=subprocess.STDOUT, stdin=subprocess.DEVNULL,
@@ -258,48 +622,253 @@ def spawn_detached(cmd, cwd, log):
     return int(pid)
 
 
-def pid_alive(pid):
-    p = run(["tasklist", "/FI", f"PID eq {pid}", "/NH"])
-    return str(pid) in p.stdout
+_SNAP = None
 
 
-def kill_tree(pid):
-    run(["taskkill", "/PID", str(pid), "/T", "/F"])
+def snapshot(fresh=False):
+    """(listening {port: pid}, established connections {port: count}, process names {pid: exe}): one netstat
+    and one tasklist, reused for 2 seconds."""
+    global _SNAP
+    if fresh or _SNAP is None or time.time() - _SNAP[0] > 2:
+        listen, est = {}, {}
+        for line in run(["netstat", "-ano", "-p", "TCP"]).stdout.splitlines():
+            parts = line.split()
+            if len(parts) < 5 or parts[0] != "TCP" or not parts[4].isdigit():
+                continue
+            port = parts[1].rsplit(":", 1)[-1]
+            if not port.isdigit():
+                continue
+            if parts[3] == "LISTENING":
+                listen[int(port)] = int(parts[4])
+            elif parts[3] == "ESTABLISHED":
+                est[int(port)] = est.get(int(port), 0) + 1
+        names = {}
+        for line in run(["tasklist", "/FO", "CSV", "/NH"]).stdout.splitlines():
+            cells = [c.strip('"') for c in line.split('","')]
+            if len(cells) >= 2 and cells[1].isdigit():
+                names[int(cells[1])] = cells[0].lower()
+        _SNAP = (time.time(), listen, est, names)
+    return _SNAP[1:]
 
 
-def netstat_lines(port):
-    p = run(["netstat", "-ano", "-p", "TCP"])
-    out = []
-    for line in p.stdout.splitlines():
-        parts = line.split()
-        if len(parts) >= 5 and parts[0] == "TCP":
-            out.append((parts[1], parts[2], parts[3], parts[4]))
-    return [l for l in out if l[0].rsplit(":", 1)[-1] == str(port)]
+def forget_snapshot():
+    global _SNAP
+    _SNAP = None
 
 
 def rojo_listeners():
     """{port: pid} of every rojo process listening on this machine."""
-    ports = {}
-    for line in run(["netstat", "-ano", "-p", "TCP"]).stdout.splitlines():
-        parts = line.split()
-        if len(parts) >= 5 and parts[0] == "TCP" and parts[3] == "LISTENING" and parts[4].isdigit():
-            port = parts[1].rsplit(":", 1)[-1]
-            if port.isdigit():
-                ports[int(port)] = int(parts[4])
-    names = {}
-    for line in run(["tasklist", "/FO", "CSV", "/NH"]).stdout.splitlines():
-        cells = [c.strip('"') for c in line.split('","')]
-        if len(cells) >= 2 and cells[1].isdigit():
-            names[int(cells[1])] = cells[0].lower()
-    return {port: pid for port, pid in ports.items() if names.get(pid, "").startswith("rojo")}
+    listen, _, names = snapshot()
+    return {port: pid for port, pid in listen.items() if names.get(pid, "").startswith("rojo")}
 
 
 def listening(port):
-    return any(l[2] == "LISTENING" for l in netstat_lines(port))
+    return port in snapshot()[0]
 
 
 def connections(port):
-    return sum(1 for l in netstat_lines(port) if l[2] == "ESTABLISHED")
+    return snapshot()[1].get(port, 0)
+
+
+def pid_alive(pid):
+    return pid in snapshot()[2]
+
+
+def kill_tree(pid):
+    run(["taskkill", "/PID", str(pid), "/T", "/F"])
+    forget_snapshot()
+
+
+def log_path(slot):
+    return HERE / f"rojo-{slot}.log"
+
+
+def log_tail(slot, n=6):
+    try:
+        text = re.sub(r"\x1b\[[0-9;]*m", "", log_path(slot).read_text(encoding="utf-8", errors="replace"))
+    except OSError:
+        return ""
+    lines = [l for l in text.strip().splitlines() if l.strip() and l.strip() != "[ERROR rojo]"]
+    crash = next((i for i, l in enumerate(lines) if "Rojo crashed" in l), None)
+    lines = [lines[crash]] + [l for l in lines[crash + 1:] if "Details" in l or "in file" in l] if crash is not None else lines
+    return "\n".join("   " + l for l in lines[-n:])
+
+
+def crashed(slot):
+    try:
+        return "Rojo crashed" in log_path(slot).read_text(encoding="utf-8", errors="replace")
+    except OSError:
+        return False
+
+
+def lz4_block(src, size):
+    """Decompress one LZ4 block (how binary .rbxm files store their chunks)."""
+    dst, i, n = bytearray(), 0, len(src)
+    while i < n:
+        token = src[i]
+        i += 1
+        lit = token >> 4
+        if lit == 15:
+            while True:
+                b = src[i]
+                i += 1
+                lit += b
+                if b != 255:
+                    break
+        dst += src[i:i + lit]
+        i += lit
+        if i >= n:
+            break
+        off = src[i] | (src[i + 1] << 8)
+        i += 2
+        ml = token & 15
+        if ml == 15:
+            while True:
+                b = src[i]
+                i += 1
+                ml += b
+                if b != 255:
+                    break
+        ml += 4
+        start = len(dst) - off
+        if off >= ml:
+            dst += dst[start:start + ml]
+        else:
+            for k in range(ml):
+                dst.append(dst[start + k])
+    return bytes(dst[:size])
+
+
+def rbxm_bytes(path):
+    """The chunk data of a binary .rbxm, decompressed, for a substring search (XML models are plain text)."""
+    data = Path(path).read_bytes()
+    if not data.startswith(b"<roblox!"):
+        return data
+    out, i = [], 32  # magic 8 + signature 6 + version 2 + class count 4 + instance count 4 + reserved 8
+    while i + 16 <= len(data):
+        name = data[i:i + 4]
+        clen, ulen = struct.unpack_from("<II", data, i + 4)
+        i += 16
+        body = data[i:i + (clen or ulen)]
+        i += clen or ulen
+        if not clen:
+            out.append(body)
+        elif body[:4] != b"\x28\xb5\x2f\xfd":  # zstd chunks are skipped
+            out.append(lz4_block(body, ulen))
+        if name == b"END\0":
+            break
+    return b"".join(out)
+
+
+ROBLOX_DIR = Path(os.environ.get("LOCALAPPDATA") or Path.home()) / "Roblox"
+PLUGIN_FILE = ROBLOX_DIR / "Plugins" / "RojoManagedPlugin.rbxm"  # where `rojo plugin install` puts it
+PLUGIN_CACHE = Path.home() / ".flow" / "rojo-plugin.json"
+PLUGIN_VERSION = re.compile(rb"Version[\x00-\xff]{0,40}?Value\x01([\x00-\xff]{4})(\d+\.\d+\.\d+[\w.+-]*)")
+
+
+def plugin_info():
+    """{"version": "7.7.1", "fork": bool} of the Rojo plugin in Studio's Plugins folder, or None when there is
+    none. fork: the riesegarder/rojo plugin (it has the "Reconnect On Server Loss" setting). Cached per file."""
+    try:
+        st = PLUGIN_FILE.stat()
+    except OSError:
+        return None
+    key = [st.st_mtime, st.st_size]
+    cache = load_json(PLUGIN_CACHE, {})
+    if cache.get("key") == key and "version" in cache:
+        return {"version": cache["version"], "fork": cache.get("fork", False)}
+    try:
+        data = rbxm_bytes(PLUGIN_FILE)
+    except Exception:
+        data = b""
+    m = PLUGIN_VERSION.search(data)
+    info = {"version": m.group(2).decode() if m else None, "fork": b"reconnectForever" in data}
+    write_json(PLUGIN_CACHE, {"key": key, **info})
+    return info
+
+
+def semver(text):
+    m = re.search(r"(\d+)\.(\d+)\.(\d+)", text or "")
+    return tuple(int(x) for x in m.groups()) if m else None
+
+
+def plugin_problems():
+    """Warnings about Studio's Rojo plugin against this project's rojo: a version Rojo refuses, or the upstream
+    plugin while rokit.toml pins the reconnecting fork."""
+    out = []
+    info = plugin_info()
+    main = main_checkout()
+    if not info:
+        return [f"note: no Rojo plugin in {PLUGIN_FILE.parent} (`rojo plugin install` puts it there); flow can't "
+                "check its version or whether it reconnects by itself"]
+    r = run(["rojo", "--version"], cwd=main)
+    have, want = semver(info["version"]), semver(r.stdout)
+    if have and want and have[:2] != want[:2]:
+        out.append(f"WARNING: Studio's Rojo plugin is {info['version']} but this project's rojo is "
+                   f"{'.'.join(map(str, want))}: they won't sync. Run `rojo plugin install` in {main.name}, then "
+                   "restart Studio")
+    toml = main / "rokit.toml"
+    pins_fork = toml.exists() and re.search(r'"riesegarder/rojo@', toml.read_text(encoding="utf-8", errors="replace"))
+    if pins_fork and not info["fork"]:
+        out.append("WARNING: rokit.toml pins the riesegarder/rojo fork but Studio has the upstream Rojo plugin, "
+                   f"which never reconnects by itself. Run `rojo plugin install` in {main.name}, then restart Studio")
+    return out
+
+
+def plugin_reconnects():
+    """True when Studio's Rojo plugin reconnects by itself after its server restarts: the riesegarder/rojo
+    fork ("-reconnect" releases) with its "Reconnect On Server Loss" setting on. FLOW_ROJO_RECONNECT=1/0
+    overrides the detection."""
+    env = os.environ.get("FLOW_ROJO_RECONNECT")
+    if env in ("0", "1"):
+        return env == "1"
+    info = plugin_info()
+    if not info or not info["fork"]:
+        return False
+    # the plugin keeps its settings per Roblox account; the most recently written one that has it decides
+    found = []
+    for p in ROBLOX_DIR.glob("*/InstalledPlugins/0/settings.json"):
+        try:
+            found.append((p.stat().st_mtime, p))
+        except OSError:
+            pass
+    for _, p in sorted(found, reverse=True):
+        try:
+            settings = json.loads(p.read_text(encoding="utf-8-sig"))
+        except (OSError, ValueError):
+            continue
+        if "Rojo_reconnectForever" in settings:
+            return settings["Rojo_reconnectForever"] is not False
+    return True  # on by default
+
+
+def studio_connected(port):
+    forget_snapshot()
+    return bool(rojo_listeners().get(port)) and connections(port) > 0
+
+
+def await_reconnect(slots, quiet=False, timeout=30):
+    """Studio's plugin reconnects to these slots by itself: say so, wait until it has, say that too.
+    Returns the slots that didn't come back (they need a manual Connect)."""
+    cfg = config()
+    if not quiet:
+        notify("flow: reconnecting", port_list(slots))
+    left = list(slots)
+    end = time.time() + timeout
+    with busy(f"Waiting for Studio to reconnect to {', '.join(slots)}"):
+        while left and time.time() < end:
+            time.sleep(1)
+            left = [s for s in left if not studio_connected(cfg["slots"][s]["port"])]
+    back = [s for s in slots if s not in left]
+    if back:
+        print(f"Studio reconnected by itself: {port_list(back)}")
+        if not quiet:
+            notify("flow: reconnected", port_list(back))
+    if left:
+        print(f"WARNING: Studio didn't reconnect within {timeout}s: {port_list(left)}. Press Connect there.")
+        if not quiet:
+            notify("flow: connect Studio", port_list(left))
+    return left
 
 
 def rojo_up(port, timeout=25):
@@ -314,42 +883,194 @@ def rojo_up(port, timeout=25):
     return None
 
 
-def pick_slot(cfg, name):
-    if not cfg["slots"]:
-        die(f"no slots on this machine yet. add one: flow slot <name> <placeId>  (config: {CONFIG})")
-    slot = name or cfg["default"] or next(iter(cfg["slots"]))
-    if slot not in cfg["slots"]:
-        die(f"unknown slot '{slot}'. slots: {', '.join(cfg['slots'])}")
-    return slot, cfg["slots"][slot]
+# ---------------------------------------------------------------- Studio MCP: flow reads Studio itself
+
+class StudioError(Exception):
+    pass
+
+
+class StudioMCP:
+    """Roblox's StudioMCP.exe over stdio, the server behind Claude's roblox-studio MCP. flow uses it to find the
+    Studio a place is open in and to run read-only Luau there (reading the FlowStamp back)."""
+
+    def __init__(self):
+        self.p = None
+        self.lines = queue.Queue()
+        self.n = 0
+
+    @staticmethod
+    def exe():
+        env = os.environ.get("FLOW_STUDIO_MCP")
+        if env:
+            return env if Path(env).exists() else None
+        found = []
+        for p in (ROBLOX_DIR / "Versions").glob("*/StudioMCP.exe"):
+            try:
+                found.append((p.stat().st_mtime, str(p)))
+            except OSError:
+                pass
+        return max(found)[1] if found else None
+
+    def __enter__(self):
+        exe = self.exe()
+        if not exe:
+            raise StudioError(f"StudioMCP.exe not found under {ROBLOX_DIR / 'Versions'}")
+        self.p = subprocess.Popen([exe], stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL,
+                                  creationflags=NO_WINDOW)
+        threading.Thread(target=self._read, daemon=True).start()
+        try:
+            self.request("initialize", {"protocolVersion": "2025-11-25", "capabilities": {},
+                                        "clientInfo": {"name": "flow", "version": VERSION}}, timeout=10)
+            self._send({"jsonrpc": "2.0", "method": "notifications/initialized"})
+        except Exception:
+            self.__exit__()
+            raise
+        return self
+
+    def __exit__(self, *exc):
+        try:
+            self.p.kill()
+        except Exception:
+            pass
+
+    def _read(self):
+        for line in self.p.stdout:
+            self.lines.put(line)
+        self.lines.put(None)
+
+    def _send(self, msg):
+        self.p.stdin.write((json.dumps(msg) + "\n").encode("utf-8"))
+        self.p.stdin.flush()
+
+    def request(self, method, params, timeout=15):
+        self.n += 1
+        mid = self.n
+        try:
+            self._send({"jsonrpc": "2.0", "id": mid, "method": method, "params": params})
+        except OSError as e:
+            raise StudioError(f"Studio MCP exited ({e})")
+        end = time.time() + timeout
+        while True:
+            try:
+                line = self.lines.get(timeout=max(0.05, end - time.time()))
+            except queue.Empty:
+                if time.time() >= end:
+                    raise StudioError(f"Studio MCP didn't answer {method} within {timeout}s")
+                continue
+            if line is None:
+                raise StudioError("Studio MCP exited")
+            try:
+                msg = json.loads(line)
+            except ValueError:
+                continue
+            if msg.get("id") == mid:
+                if "error" in msg:
+                    raise StudioError(str(msg["error"].get("message", msg["error"])))
+                return msg.get("result") or {}
+
+    def tool(self, name, args, timeout=15):
+        r = self.request("tools/call", {"name": name, "arguments": args}, timeout)
+        text = "\n".join(c.get("text", "") for c in r.get("content", []) if isinstance(c, dict))
+        if r.get("isError"):
+            raise StudioError(text.strip()[-300:] or f"{name} failed")
+        return text
+
+    def studios(self):
+        return json.loads(self.tool("list_roblox_studios", {}) or "{}").get("studios", [])
+
+    def studios_for(self, place_id):
+        return [s["id"] for s in self.studios() if int(s.get("placeId") or 0) == int(place_id)]
+
+    def luau(self, studio_id, code, datamodel="Edit", timeout=15):
+        return self.tool("execute_luau", {"studio_id": studio_id, "datamodel_type": datamodel, "code": code}, timeout)
+
+
+def find_studio(place_id):
+    """(studio_id, None) of the Studio that has this place open, or (None, why not)."""
+    try:
+        with StudioMCP() as mcp:
+            ids = mcp.studios_for(place_id)
+    except (StudioError, OSError, ValueError) as e:
+        return None, f"the Studio MCP didn't answer: {e}"
+    if not ids:
+        return None, f"no open Studio has place {place_id} (or Studio's MCP server is off)"
+    return ids[0], None
+
+
+STAMP_TAG = "flowstamp="
+
+
+def stamp_check(place_id, want, timeout=20):
+    """Read the FlowStamp back from the Studio that has place_id open (Edit datamodel, read-only) until it equals
+    want. Returns (status, studio_id, detail): "synced" (detail: how long it took), "stale" (detail: Studio's
+    value) or "unavailable" (detail: why flow couldn't read it)."""
+    code = f'{stamp_lookup()} return "{STAMP_TAG}" .. tostring(v and v.Value)'
+    start = time.time()
+    try:
+        with StudioMCP() as mcp, busy("Reading the stamp back from Studio"):
+            ids = mcp.studios_for(place_id)
+            if not ids:
+                return "unavailable", None, f"no open Studio has place {place_id} (or Studio's MCP server is off)"
+            have = None
+            while True:
+                for sid in ids:
+                    out = mcp.luau(sid, code).strip()
+                    have = out.split(STAMP_TAG, 1)[1] if STAMP_TAG in out else out
+                    if have == want:
+                        return "synced", sid, f"{time.time() - start:.1f}s"
+                if time.time() - start > timeout:
+                    return "stale", ids[0], have
+                time.sleep(0.5)
+    except (StudioError, OSError, ValueError) as e:
+        return "unavailable", None, str(e)
+
+
+def state():
+    return load_json(STATE, {})
+
+
+def save_state(s):
+    write_json(STATE, s)
+
+
+def slot_report(cfg, slot):
+    """(slot settings, state entry, running, Studio connections). Running means a rojo listens on the slot's
+    port, whatever pid state.json recorded; the entry is refreshed when it's off."""
+    sinfo = cfg["slots"][slot]
+    pid = rojo_listeners().get(sinfo["port"])
+    st = state()
+    info = st.get(slot)
+    if pid and (not info or info.get("pid") != pid or info.get("port") != sinfo["port"]):
+        info = {"pid": pid, "port": sinfo["port"], "worktree": (info or {}).get("worktree") or str(stage_path(slot)),
+                "started": (info or {}).get("started", time.time())}
+        st[slot] = info
+        save_state(st)
+    running = bool(pid)
+    return sinfo, info, running, connections(sinfo["port"]) if running else 0
 
 
 def stop_slot(slot):
-    """Stop the slot's server: the one state.json records, and any rojo still listening on the slot's port
-    (a server state.json lost track of, e.g. after state was copied or edited by hand)."""
+    """Stop the slot's server: any rojo on the slot's port (or the port state.json recorded), and the launcher
+    state.json recorded if it's still there."""
     st = state()
-    info = st.pop(slot, None)
+    info = st.pop(slot, None) or {}
+    ports = {config()["slots"].get(slot, {}).get("port"), info.get("port")} - {None}
+    forget_snapshot()
     stopped = False
-    if info and pid_alive(info["pid"]):
-        kill_tree(info["pid"])
-        stopped = True
-    port = config()["slots"].get(slot, {}).get("port")
-    stray = rojo_listeners().get(port) if port else None
-    if stray:
-        kill_tree(stray)
+    for port in ports:
+        pid = rojo_listeners().get(port)
+        if pid:
+            kill_tree(pid)
+            stopped = True
+    pid = info.get("pid")
+    if pid and snapshot()[2].get(pid) in ("cmd.exe", "rojo.exe"):
+        kill_tree(pid)
         stopped = True
     if stopped:
         time.sleep(0.5)
+        forget_snapshot()
     save_state(st)
-    return bool(info) or stopped
-
-
-def user_only(cmd):
-    # Restarting the server forces the user to reconnect Studio, so agents may not. isatty() can't tell
-    # (Windows reports NUL as a tty); agent shells carry these variables.
-    agent = any(os.environ.get(k) for k in ("CLAUDECODE", "AI_AGENT"))
-    if agent and not os.environ.get("FLOW_ALLOW_AGENT"):
-        die(f"`flow {cmd}` is a manual command for the user. Agents: don't start or stop servers; "
-            "use `flow where` / `flow status`, and if nothing is served ask the user to run `flow up`.", 4)
+    return stopped
 
 
 def check_origin(main):
@@ -379,42 +1100,54 @@ def check_origin(main):
 def cmd_up(a):
     user_only("up")
     cfg = config()
-    main = main_checkout(Path.cwd())
-    check_origin(main)
+    names = slot_args(a)
     if a.all:
-        if a.name:
-            die("--all serves every slot's stage; it takes no worktree name")
+        if names or a.tree:
+            die("--all serves every slot's stage; give no slot names and no --tree")
         targets = list(cfg["slots"])
     else:
-        targets = [pick_slot(cfg, a.slot)[0]]
-    done = []
+        check_slots(cfg, names)
+        targets = names or [pick_slot(cfg, None)[0]]
+    if a.tree and len(targets) > 1:
+        die("--tree serves one worktree: give one slot")
+    check_origin(main_checkout())
+    up_slots(targets, tree=a.tree, base=a.base, quiet=a.quiet)
+
+
+def up_slots(targets, tree=None, base="main", quiet=False):
+    cfg = config()
+    main = main_checkout()
+    done, auto = [], []
     for slot in targets:
         sinfo = cfg["slots"][slot]
         print(f"--- {slot} ({sinfo['label']})")
-        if a.name:
-            wt = main / ".claude" / "worktrees" / a.name
+        if tree:
+            wt = main / ".claude" / "worktrees" / tree
             if wt.exists():
                 print(f"worktree exists, reusing: {wt}")
             else:
-                branch = f"claude/{a.name}"
+                branch = f"claude/{tree}"
                 have = run(["git", "rev-parse", "--verify", "--quiet", f"refs/heads/{branch}"], cwd=main).returncode == 0
-                cmd = ["git", "worktree", "add", str(wt)] + ([branch] if have else ["-b", branch, a.base])
+                cmd = ["git", "worktree", "add", str(wt)] + ([branch] if have else ["-b", branch, base])
                 run(cmd, cwd=main, check=True)
                 print(f"worktree created: {wt} ({branch})")
         else:
-            wt = main / ".claude" / "worktrees" / stage_name(slot)
+            wt = stage_path(slot)
             if not wt.exists():
-                run(["git", "worktree", "add", "--detach", str(wt), a.base], cwd=main, check=True)
+                run(["git", "worktree", "add", "--detach", str(wt), base], cwd=main, check=True)
                 print(f"stage created: {wt}")
             else:
                 print(f"stage: {wt}")
-        serve(slot, sinfo, wt, main)
-        done.append(slot)
+        if serve(slot, sinfo, wt, main):
+            auto.append(slot)
+        else:
+            done.append(slot)
     print()
+    if not quiet and done:
+        notify("flow: connect Studio", port_list(done))
+    if auto:
+        await_reconnect(auto, quiet)
     print("sessions claim a free slot with `flow doctor` and `flow push` their own worktree onto its stage")
-    if not a.quiet:
-        names = ", ".join(cfg["slots"][s]["label"] for s in done)
-        notify("flow: connect Studio", names)
 
 
 PKG_DIRS = ("Packages", "ServerPackages", "DevPackages")
@@ -436,6 +1169,8 @@ def wally_hash(tree):
 
 
 def packages_current(tree):
+    if not (tree / "wally.toml").exists():
+        return True  # no Wally packages in this project
     pk = tree / "Packages"
     mark = wally_mark(tree)
     return (pk.is_dir() and not pk.is_junction() and mark.exists()
@@ -474,13 +1209,24 @@ def setup(tree):
     return True, "setup: " + ", ".join(notes)
 
 
+def slot_place_ids():
+    return [s["placeId"] for s in config()["slots"].values()]
+
+
 def serve(slot, sinfo, wt, main):
+    """Serve wt on the slot's port. Returns True when Studio was connected to the old server on this port and
+    its plugin reconnects by itself (the riesegarder/rojo fork), so nobody has to press Connect."""
+    was = studio_connected(sinfo["port"])
     if stop_slot(slot):  # before setup: rojo stops syncing package folders that are reinstalled under it
         print(f"stopped the previous server on {slot}")
     regen_blink(wt)
     ok, msg = setup(wt)
     print(msg if ok else f"setup failed (continuing): {msg}")
 
+    if is_stage(wt):  # a stage is main's code: it lacks places added since the last commit
+        added = add_place_ids(wt / "default.project.json", slot_place_ids())
+        if added:
+            print(f"stage: added place(s) {', '.join(map(str, added))} to servePlaceIds")
     proj = load_json(wt / "default.project.json", {})
     if sinfo["placeId"] not in proj.get("servePlaceIds", []):
         print(f"WARNING: place {sinfo['placeId']} is not in servePlaceIds, Studio will refuse to sync")
@@ -488,22 +1234,27 @@ def serve(slot, sinfo, wt, main):
     port = sinfo["port"]
     if port == proj.get("servePort"):
         die(f"slot {slot} uses port {port}, the main place's servePort: they would sync the same server. "
-            f"Give the slot another port: flow slot {slot} {sinfo['placeId']} --port <free port>")
+            f"Renumber the slots with `flow ports`.")
+    forget_snapshot()
     if listening(port):
-        die(f"port {port} is used by something that is not a flow server. free it or change the slot port in {CONFIG}")
+        pid = snapshot()[0][port]
+        die(f"port {port} is used by {snapshot()[2].get(pid, 'another program')} (pid {pid}), not a flow server. "
+            "Free it, or move the slots with `flow ports`.")
 
-    log = HERE / f"rojo-{slot}.log"
-    pid = spawn_detached(["rojo", "serve", "--port", str(port), "default.project.json"], wt, log)
-    info = rojo_up(port)
-    if not info:
-        kill_tree(pid)
-        die(f"rojo did not answer on {port}. log: {log}")
+    log = log_path(slot)
+    launcher = spawn_detached(["rojo", "serve", "--port", str(port), "default.project.json"], wt, log)
+    if not rojo_up(port):
+        kill_tree(launcher)
+        die(f"rojo did not answer on {port}. log: {log}\n{log_tail(slot)}")
+    forget_snapshot()
+    pid = rojo_listeners().get(port, launcher)  # the real rojo.exe, behind cmd and rokit's shim
     st = state()
     st[slot] = {"pid": pid, "port": port, "worktree": str(wt), "started": time.time()}
     save_state(st)
 
     print(f"setup ok, port {port}. Connect Studio ({sinfo['label']}, place {sinfo['placeId']}) to localhost:{port}.")
     print(f"FLOW_UP worktree={wt} port={port} slot={slot}")
+    return was and plugin_reconnects()
 
 
 def cmd_down(a):
@@ -516,15 +1267,17 @@ def cmd_down(a):
         print(f"stopped rojo on port {a.port} (pid {pid})")
         return
     cfg = config()
-    if a.all or a.slot == "all":
-        if a.all and a.slot and a.slot != "all":
-            die("--all stops every slot; it takes no slot name")
+    names = slot_args(a)
+    if a.all or "all" in names:
+        if set(names) - {"all"}:
+            die("`down all` stops every slot; it takes no slot names")
         names = list(dict.fromkeys(list(cfg["slots"]) + list(state())))  # also servers whose slot left the config
         stopped = [n for n in names if stop_slot(n)]
         print(f"stopped {', '.join(stopped)}" if stopped else "nothing was running")
         return
-    slot, _ = pick_slot(cfg, a.slot)
-    print(f"stopped {slot}" if stop_slot(slot) else f"{slot} was not running")
+    check_slots(cfg, names)
+    for slot in names or [pick_slot(cfg, None)[0]]:
+        print(f"stopped {slot}" if stop_slot(slot) else f"{slot} was not running")
 
 
 def pull_main(main):
@@ -558,35 +1311,89 @@ def pull_main(main):
     return True
 
 
+def served_worktree(slot, main):
+    prev = state().get(slot, {}).get("worktree")
+    return Path(prev) if prev and Path(prev).exists() else stage_path(slot)
+
+
 def cmd_restart(a):
     user_only("update" if a.pull else "restart")
     cfg = config()
-    main = main_checkout(Path.cwd())
+    main = main_checkout()
+    names = slot_args(a)
+    check_slots(cfg, names)
     if a.pull and not pull_main(main):
         die("nothing was stopped. Fix main first, or use `flow restart` to restart without pulling.", 2)
-    st = state()
     if a.all:
         targets = list(cfg["slots"])
+    elif names:
+        targets = names
     else:
-        targets = [n for n, i in st.items() if n in cfg["slots"] and pid_alive(i["pid"])]
+        targets = [n for n in cfg["slots"] if slot_report(cfg, n)[2]]
     if not targets:
         print("no servers running; nothing to restart. (`flow up --all` starts every slot)")
         return
-    done = []
+    manual, auto = [], []
     for slot in targets:
         sinfo = cfg["slots"][slot]
-        prev = st.get(slot, {}).get("worktree")
-        wt = Path(prev) if prev and Path(prev).exists() else main / ".claude" / "worktrees" / stage_name(slot)
+        wt = served_worktree(slot, main)
         if not wt.exists():
             run(["git", "worktree", "add", "--detach", str(wt), "main"], cwd=main, check=True)
             print(f"stage created: {wt}")
         print(f"--- {slot} ({sinfo['label']})")
-        serve(slot, sinfo, wt, main)
-        done.append(slot)
+        (auto if serve(slot, sinfo, wt, main) else manual).append(slot)
     print()
-    print("reconnect Studio on each restarted slot; sessions then `flow push` again to refresh the stamp")
+    if manual:
+        print(f"reconnect Studio on {', '.join(manual)}")
+        if not a.quiet:
+            notify("flow: reconnect Studio", port_list(manual))
+    if auto:
+        await_reconnect(auto, a.quiet)
+    print("sessions then `flow push` again to refresh the stamp")
+
+
+def cmd_ports(a):
+    """Renumber the slots from the main place port: main + 1, main + 2, ... in slot order, skipping ports other
+    projects or other programs use. Running servers move to their new port."""
+    cfg = config()
+    mp = main_port()
+    mine = {s["port"] for s in cfg["slots"].values()}
+    forget_snapshot()
+    used = other_ports() | {mp} | {p for p in snapshot()[0] if p not in mine}
+    plan, nxt = {}, mp + 1
+    for n in cfg["slots"]:
+        while nxt in used:
+            nxt += 1
+        plan[n] = nxt
+        nxt += 1
+    moves = {n: p for n, p in plan.items() if cfg["slots"][n]["port"] != p}
+    for n, p in plan.items():
+        old = cfg["slots"][n]["port"]
+        print(f"{n} {cfg['slots'][n]['label']}: port {old}" + (f" -> {p}" if old != p else " (unchanged)"))
+    if not moves:
+        print(f"slot ports already count up from the main place port {mp}")
+        return
+    if a.dry_run:
+        print("dry run: nothing changed. Run `flow ports` to renumber.")
+        return
+    user_only("ports")
+    running = {n: served_worktree(n, main_checkout()) for n in moves if slot_report(cfg, n)[2]}
+    for n in running:  # all first: a new port may be one another slot still has
+        stop_slot(n)
+    m = local()
+    m["ports"].update(moves)
+    save_local(m)
+    cfg = config()
+    for n, wt in running.items():
+        print(f"--- {n} ({cfg['slots'][n]['label']})")
+        serve(n, cfg["slots"][n], wt, main_checkout())
+    print()
+    print("Studio's Rojo plugin remembers the old port per place: enter the new port once in each of these places"
+          + (" (press Stop first: the plugin keeps retrying the old port)" if plugin_reconnects() else ""))
+    for n in moves:
+        print(f"  {cfg['slots'][n]['label']} (place {cfg['slots'][n]['placeId']}): localhost:{moves[n]}")
     if not a.quiet:
-        notify("flow: reconnect Studio", ", ".join(cfg["slots"][s]["label"] for s in done))
+        notify("flow: connect Studio on the new ports", port_list(moves))
 
 
 def process_table():
@@ -603,52 +1410,41 @@ def process_table():
 
 
 def heal():
-    """Adopt servers this project started but lost track of: a rojo listening on a port no slot has, whose
-    launcher writes this project's `rojo-<slot>.log`. Its slot's port and state are pointed at it, so sessions
-    can push again without anyone restarting the server (which would disconnect Studio)."""
+    """Adopt servers this project started on a port no slot has (their launcher writes this project's
+    `rojo-<slot>.log`, here or in flow 1.1's folder): the slot's port moves to it, no restart, so Studio stays
+    connected. A server on the slot's own port needs nothing: running is decided by the port."""
     cfg = config()
     known = {s["port"] for s in cfg["slots"].values()} | other_ports() | {main_port()}
     strays = {port: pid for port, pid in rojo_listeners().items() if port not in known}
     if not strays:
         return
     table = process_table()
-    log_re = re.compile(re.escape(str(HERE / "rojo-")) + r"([^\\/\"]+)\.log", re.I)
-    st = state()
-    changed = False
+    dirs = "|".join(re.escape(str(d) + os.sep) for d in (HERE, LEGACY_ROOT / project_key()))
+    log_re = re.compile(rf"(?:{dirs})rojo-([^\\/\"]+)\.log", re.I)
+    m, st, changed = local(), state(), False
     for port, pid in strays.items():
-        cur, slot, owner = pid, None, pid
+        cur, slot = pid, None
         for _ in range(5):
             if cur not in table:
                 break
             parent, line = table[cur]
-            m = log_re.search(line)
-            if m:
-                slot, owner = m.group(1), cur
+            hit = log_re.search(line)
+            if hit:
+                slot = hit.group(1)
                 break
             cur = parent
-        if not slot or slot not in cfg["slots"]:
-            continue
-        info = st.get(slot)
-        if info and pid_alive(info["pid"]) and listening(cfg["slots"][slot]["port"]):
+        if not slot or slot not in cfg["slots"] or rojo_listeners().get(cfg["slots"][slot]["port"]):
             continue
         old = cfg["slots"][slot]["port"]
-        cfg["slots"][slot]["port"] = port
-        st[slot] = {"pid": owner, "port": port, "worktree": str(main_checkout() / ".claude" / "worktrees" / stage_name(slot)),
-                    "started": time.time()}
+        m["ports"][slot] = port
+        st[slot] = {"pid": pid, "port": port, "worktree": str(stage_path(slot)), "started": time.time()}
         changed = True
         print(f"WARNING: {slot}'s server runs on port {port}, not {old}: flow lost track of it. Adopted it: "
               f"{slot} now uses port {port} (connect its Studio to localhost:{port}).")
     if changed:
-        CONFIG.write_text(json.dumps(cfg, indent=2), encoding="utf-8")
+        save_local(m)
         save_state(st)
-
-
-def slot_report(cfg, slot):
-    sinfo = cfg["slots"][slot]
-    info = state().get(slot)
-    running = bool(info and pid_alive(info["pid"]) and listening(sinfo["port"]))
-    n = connections(sinfo["port"]) if running else 0
-    return sinfo, info, running, n
+        reconfig()
 
 
 # ---------------------------------------------------------------- leases: one session per slot
@@ -658,7 +1454,41 @@ def leases():
 
 
 def save_leases(l):
-    LEASES.write_text(json.dumps(l, indent=2), encoding="utf-8")
+    write_json(LEASES, l)
+
+
+@contextlib.contextmanager
+def lease_lock():
+    """One claim at a time: three sessions running `flow doctor` at once all claimed the same slot."""
+    path = HERE / "leases.lock"
+    path.parent.mkdir(parents=True, exist_ok=True)
+    end = time.time() + 20
+    while True:
+        try:
+            os.close(os.open(path, os.O_CREAT | os.O_EXCL | os.O_WRONLY))
+            break
+        except FileExistsError:
+            try:
+                if time.time() - path.stat().st_mtime > 30:  # left by a flow that was killed
+                    path.unlink(missing_ok=True)
+                    continue
+            except OSError:
+                pass
+            if time.time() > end:
+                die(f"the slot leases are locked by another flow ({path}); try again")
+            time.sleep(0.1)
+    try:
+        yield
+    finally:
+        path.unlink(missing_ok=True)
+
+
+STALE_HOURS = 2  # `flow release --stale` frees slots that saw no push for this long
+
+
+def ago(t):
+    s = time.time() - t
+    return f"{s / 60:.0f} min ago" if s < 5400 else f"{s / 3600:.1f}h ago"
 
 
 def lease_live(lease):
@@ -685,36 +1515,37 @@ def stage_served(cfg, slot):
 
 def claim(tree, want=None):
     """This worktree's slot: its live lease, else a free served stage (Studio-connected ones first)."""
-    cfg = config()
-    have = lease_of(tree)
-    if have and (not want or want == have):
-        touch_lease(have, tree)
-        return have, False
-    if want:
-        pick_slot(cfg, want)
-        lease = leases().get(want)
-        if lease and lease_live(lease) and not same_path(lease["tree"], tree):
-            die(f"{want} is held by {Path(lease['tree']).name}. Never take another session's Studio; "
-                "run `flow doctor` without --slot to get a free one.", 2)
-        if have:
-            release(have)
-        touch_lease(want, tree)
-        return want, True
-    free = []
-    for slot in cfg["slots"]:
-        lease = leases().get(slot)
-        if lease and lease_live(lease):
-            continue
-        served, n = stage_served(cfg, slot)
-        if served:
-            free.append((0 if n else 1, slot != cfg["default"], slot))
-    if not free:
-        die("no free Studio slot: every served stage is held by another session (or nothing is served). "
-            "Ask the user to open another scratch place and run `flow slot <name> <placeId>` + `flow up --slot <name>` "
-            "(or end a finished session with `flow release` in its worktree). Run `flow status` to show them.", 2)
-    slot = sorted(free)[0][2]
-    touch_lease(slot, tree)
-    return slot, True
+    with lease_lock():
+        cfg = config()
+        have = lease_of(tree)
+        if have and (not want or want == have):
+            touch_lease(have, tree)
+            return have, False
+        if want:
+            pick_slot(cfg, want)
+            lease = leases().get(want)
+            if lease and lease_live(lease) and not same_path(lease["tree"], tree):
+                die(f"{want} is held by {Path(lease['tree']).name}. Never take another session's Studio; "
+                    "run `flow doctor` without a slot to get a free one.", 2)
+            if have:
+                release(have)
+            touch_lease(want, tree)
+            return want, True
+        free = []
+        for slot in cfg["slots"]:
+            lease = leases().get(slot)
+            if lease and lease_live(lease):
+                continue
+            served, n = stage_served(cfg, slot)
+            if served:
+                free.append((0 if n else 1, slot != cfg["default"], slot))
+        if not free:
+            die("no free Studio slot: every served stage is held by another session (or nothing is served). "
+                "Ask the user to open another scratch place and run `flow slot <name> <placeId>` (it serves it too), "
+                "or end a finished session with `flow release` in its worktree. Run `flow status` to show them.", 2)
+        slot = sorted(free)[0][2]
+        touch_lease(slot, tree)
+        return slot, True
 
 
 def release(slot):
@@ -724,16 +1555,30 @@ def release(slot):
 
 
 def cmd_release(a):
-    if a.slot:
-        user_only("release --slot")
-        release(a.slot)
-        print(f"released {a.slot}")
+    slot = one_slot(a)
+    if a.stale:
+        user_only("release --stale")
+        config()  # slot names for the output
+        with lease_lock():
+            l = leases()
+            gone = [s for s, lease in l.items()
+                    if not Path(lease["tree"]).exists() or time.time() - lease["at"] > a.older_than * 3600]
+            for s in gone:
+                l.pop(s)
+            save_leases(l)
+        print(f"released {', '.join(gone)}" if gone else f"no slot is idle for over {a.older_than:g}h")
         return
-    slot = lease_of(toplevel())
-    if not slot:
-        print("this worktree holds no slot")
-        return
-    release(slot)
+    with lease_lock():
+        if slot:
+            user_only("release <slot>")
+            release(slot)
+            print(f"released {slot}")
+            return
+        slot = lease_of(toplevel())
+        if not slot:
+            print("this worktree holds no slot")
+            return
+        release(slot)
     print(f"released {slot}; another session can claim it now")
 
 
@@ -741,17 +1586,42 @@ def cmd_status(a):
     heal()
     cfg = config()
     ls = leases()
+    if a.json:
+        rows = []
+        for slot in cfg["slots"]:
+            sinfo, info, running, n = slot_report(cfg, slot)
+            lease = ls.get(slot)
+            live = bool(lease and lease_live(lease))
+            rows.append({"slot": slot, "label": sinfo["label"], "placeId": sinfo["placeId"], "port": sinfo["port"],
+                         "running": running, "studioConnected": bool(n),
+                         "stage": info["worktree"] if running else None, "crashed": not running and crashed(slot),
+                         "heldBy": Path(lease["tree"]).name if live else None,
+                         "idleMinutes": round((time.time() - lease["at"]) / 60) if live else None})
+        sys.stdout.write(json.dumps({"mainPort": main_port(), "default": cfg["default"], "slots": rows}) + "\n")
+        return
+    if not cfg["slots"]:
+        print("no slots on this machine yet: flow slot <name> <placeId>")
+    idle = []
     for slot in cfg["slots"]:
         sinfo, info, running, n = slot_report(cfg, slot)
         lease = ls.get(slot)
-        held = (f", held by {Path(lease['tree']).name} ({(time.time() - lease['at']) / 60:.0f} min ago)"
-                if lease and lease_live(lease) else ", free")
+        held = ", free"
+        if lease and lease_live(lease):
+            held = f", held by {Path(lease['tree']).name} (last push {ago(lease['at'])})"
+            if time.time() - lease["at"] > STALE_HOURS * 3600:
+                idle.append(slot)
+        head = f"{slot} {sinfo['label']} port {sinfo['port']} place {sinfo['placeId']}"
         if running:
             conn = "Studio connected" if n else "NO Studio connected"
-            print(f"{slot} {sinfo['label']} port {sinfo['port']} place {sinfo['placeId']}: running, {conn}, "
-                  f"tree {Path(info['worktree']).name}{held}")
+            print(f"{head}: running, {conn}, tree {Path(info['worktree']).name}{held}")
+        elif listening(sinfo["port"]):
+            pid = snapshot()[0][sinfo["port"]]
+            print(f"{head}: not running; the port is taken by {snapshot()[2].get(pid, '?')} (pid {pid}). "
+                  "Move the slots with `flow ports`")
+        elif crashed(slot):
+            print(f"{head}: not running, Rojo crashed ({log_path(slot)}):\n{log_tail(slot)}")
         else:
-            print(f"{slot} {sinfo['label']} port {sinfo['port']} place {sinfo['placeId']}: not running")
+            print(f"{head}: not running")
     print(f"main place port {main_port()} (slots must differ)")
     known = {s["port"] for s in cfg["slots"].values()} | other_ports() | {main_port()}
     for port, pid in sorted(rojo_listeners().items()):
@@ -761,31 +1631,135 @@ def cmd_status(a):
     print(f"state: {HERE}")
     clash = [slot for slot, s in cfg["slots"].items() if s["port"] == main_port()]
     if clash:
-        print(f"WARNING: {', '.join(clash)} use the main place's port; fix with flow slot <name> <placeId> --port <free port>")
+        print(f"WARNING: {', '.join(clash)} use the main place's port; renumber with `flow ports`")
+    reserved = {int(p) for p in project().get("reservedPorts") or []}
+    clash = [slot for slot, s in cfg["slots"].items() if s["port"] in reserved]
+    if clash:
+        print(f"WARNING: {', '.join(clash)} use a port in reservedPorts ({project_file().name}); renumber with `flow ports`")
+    if idle:
+        print(f"note: {', '.join(idle)} saw no push for over {STALE_HOURS}h; `flow release --stale` frees them")
+    for p in plugin_problems():
+        print(p)
     print("(connected = an open TCP connection to the port; heuristic)")
 
 
-def cmd_slot(a):
-    """Add or update a slot: a scratch place with its own port and stage."""
+def list_slots():
     cfg = config()
-    slots = cfg["slots"]
-    cur = slots.get(a.name, {})
-    mp = main_port()
-    mine = {n: s["port"] for n, s in slots.items() if n != a.name}
-    used = set(mine.values()) | other_ports() | {mp}
-    port = a.port or cur.get("port") or max(used | {37844}) + 1
-    if port in used:
-        die(f"port {port} is already taken (main place {mp}, other slots or other projects). "
-            "Every slot needs its own port, different from the main place's servePort.")
-    cfg["mainPort"] = mp
-    slots[a.name] = {"port": port, "placeId": a.place, "label": a.label or cur.get("label") or a.name}
-    cfg["default"] = cfg.get("default") or a.name
-    CONFIG.write_text(json.dumps(cfg, indent=2), encoding="utf-8")
-    print(f"{a.name}: {slots[a.name]['label']}, place {a.place}, port {port}")
-    proj = load_json(main_checkout() / "default.project.json", {})
-    if a.place not in proj.get("servePlaceIds", []):
-        print(f"WARNING: place {a.place} is not in default.project.json servePlaceIds; Studio will refuse to sync")
-    print(f"next: flow up --slot {a.name}, then connect that place to localhost:{port} (once)")
+    if not cfg["slots"]:
+        print("no slots on this machine yet: flow slot <name> <placeId>")
+    for n, s in cfg["slots"].items():
+        print(f"{n} {s['label']} port {s['port']} place {s['placeId']}" + (" (default)" if n == cfg["default"] else ""))
+    elsewhere = [n for n in (project().get("slots") or {}) if n not in cfg["slots"]]
+    if elsewhere:
+        print(f"(other devices only: {', '.join(elsewhere)})")
+    print(f"(slots: {project_file().name}; ports: {LOCAL})")
+
+
+def place_id(text):
+    """A place id from a number or a pasted link (roblox.com/games/<id>/..., ...?placeId=<id>)."""
+    if text is None:
+        return None
+    text = str(text).strip()
+    if text.isdigit():
+        return int(text)
+    m = re.search(r"/games/(\d+)", text) or re.search(r"[?&]placeId=(\d+)", text, re.I)
+    if not m:
+        die(f"'{text}' is neither a place id nor a roblox.com/games/<id> link")
+    return int(m.group(1))
+
+
+def cmd_slot(a):
+    """Add, update or remove a slot. Slots are saved in flow.json, so every device gets them; ports stay per
+    machine. Adding one also puts its place in servePlaceIds and serves it."""
+    if not a.name:
+        return list_slots()
+    user_only("slot")
+    shared = dict(project().get("slots") or {})
+    m = local()
+    own = dict(m.get("slots") or {})
+    if a.remove:
+        if a.name not in shared and a.name not in own:
+            die(f"no slot '{a.name}'")
+        if a.name in config()["slots"] and stop_slot(a.name):
+            print(f"stopped {a.name}'s server")
+        if shared.pop(a.name, None) is not None:
+            save_slots(shared)
+        m = local()
+        own.pop(a.name, None)
+        m["slots"] = own
+        m["ports"].pop(a.name, None)
+        save_local(m)
+        with lease_lock():
+            release(a.name)
+        print(f"removed slot {a.name}")
+        return
+    cur = own.get(a.name) or shared.get(a.name) or {}
+    a.place = place_id(a.place)
+    if a.place is None and not cur:
+        die(f"give its place id: flow slot {a.name} <placeId>")
+    before = config()["slots"].get(a.name)
+    entry = dict(cur)
+    if a.place:
+        entry["placeId"] = a.place
+    entry["label"] = a.label or cur.get("label") or a.name
+    if a.here:
+        entry["hosts"] = sorted(set(entry.get("hosts", [])) | {host()})
+    machine_only = a.name in own
+    if machine_only:
+        own[a.name] = entry
+    else:
+        shared[a.name] = entry
+        save_slots(shared)
+    m = local()
+    m["slots"] = own
+    if a.port:
+        others = {p for n, p in m["ports"].items() if n != a.name and n in config()["slots"]}
+        if a.port in other_ports() | {main_port()} | others:
+            die(f"port {a.port} is already taken (main place {main_port()}, other slots, reservedPorts or other projects)")
+        m["ports"][a.name] = a.port
+    save_local(m)
+    cfg = config()
+    if a.name not in cfg["slots"]:
+        print(f"saved {a.name} in {project_file().name}; it's for {', '.join(entry.get('hosts', []))}, not this machine")
+        return
+    s = cfg["slots"][a.name]
+    where = f"{LOCAL} (this machine only)" if machine_only else f"{project_file().name}: commit it so other devices get it"
+    print(f"saved slot {a.name}: {s['label']}, place {s['placeId']}, port {s['port']} (in {where})")
+
+    proj = main_checkout() / "default.project.json"
+    if a.no_add:
+        if s["placeId"] not in load_json(proj, {}).get("servePlaceIds", []):
+            print(f"WARNING: place {s['placeId']} is not in default.project.json servePlaceIds; Studio will refuse to sync")
+    elif add_place_ids(proj, [s["placeId"]]):
+        print(f"added place {s['placeId']} to default.project.json servePlaceIds (commit it)")
+
+    if a.no_up:
+        print(f"next: flow up {a.name}, then connect that place to localhost:{s['port']} (once)")
+        return
+    if slot_report(cfg, a.name)[2] and before and (before["port"], before["placeId"]) == (s["port"], s["placeId"]):
+        print(f"{a.name} is already served on port {s['port']}; nothing to restart")
+        return
+    check_origin(main_checkout())
+    up_slots([a.name], quiet=a.quiet)
+
+
+def cmd_register(a):
+    """Reserve this project's main-place port (servePort) so no slot, here or in another project, shares it.
+    Keeps the current servePort when nobody uses it, else moves it to the next free port."""
+    user_only("register")
+    path = main_checkout() / "default.project.json"
+    cur = main_port()
+    taken = other_ports() | {s["port"] for s in config()["slots"].values()}
+    port = cur
+    if cur in taken:
+        port = max(taken | {cur, 37844}) + 1
+        text = re.sub(r'("servePort"\s*:\s*)\d+', rf"\g<1>{port}", read_raw(path), count=1)
+        write_raw(path, text)
+        print(f"servePort {cur} is already used: changed default.project.json to {port}")
+    cfg = reconfig()
+    print(f"main place port {port}")
+    if [s["port"] for s in cfg["slots"].values()] != list(range(port + 1, port + 1 + len(cfg["slots"]))):
+        print(f"note: `flow ports` renumbers the slots from {port}")
 
 
 def cmd_where(a):
@@ -797,19 +1771,28 @@ def cmd_where(a):
         die("this worktree holds no slot yet; `flow doctor` claims one", 2)
     sinfo = cfg["slots"][slot]
     _, info, running, n = slot_report(cfg, slot)
+    sid, why = find_studio(sinfo["placeId"])
+    if a.json:
+        out = {"slot": slot, "label": sinfo["label"], "placeId": sinfo["placeId"], "port": sinfo["port"],
+               "studioConnected": bool(n), "studioId": sid, "stage": info["worktree"] if running else None}
+        sys.stdout.write(json.dumps(out) + "\n")
+        return
     print(f"slot={slot} label={sinfo['label']} place={sinfo['placeId']} port={sinfo['port']} "
           f"studio={'connected' if n else 'NOT connected'} stage={info['worktree'] if running else '(not served)'}")
-    print(f"use the roblox-studio studio_id whose placeId is {sinfo['placeId']}, never another one")
+    if sid:
+        print(f"studio_id={sid}: use it for every Studio call, never another one")
+    else:
+        print(f"no studio_id: {why}. Use the roblox-studio studio_id whose placeId is {sinfo['placeId']}, never another one")
 
 
 def cmd_doctor(a):
     """Session preflight: claims this worktree's slot, then checks everything flow can check."""
     heal()
-    cfg = config()
     tree = toplevel()
     if is_stage(tree) or same_path(tree, main_checkout()):
         die("run this in your session's own worktree, not the main checkout or a stage", 2)
-    slot, new = claim(tree, a.slot)
+    slot, new = claim(tree, one_slot(a))
+    cfg = config()
     sinfo = cfg["slots"][slot]
     _, info, running, n = slot_report(cfg, slot)
     print(f"{'claimed' if new else 'holding'} {slot}: {sinfo['label']}, place {sinfo['placeId']}, port {sinfo['port']}")
@@ -822,17 +1805,24 @@ def cmd_doctor(a):
 
     synced, msg = sync_with_main(tree)
     line(synced, msg, "resolve it: `git rebase main`, fix the conflicts, `git rebase --continue`, then doctor again")
-    line(running, f"rojo server on {slot} (port {sinfo['port']})", f"ask the user to run `flow up --slot {slot}`")
+    crash = " (it crashed: `flow status` shows the log)" if not running and crashed(slot) else ""
+    line(running, f"rojo server on {slot} (port {sinfo['port']}){crash}", f"ask the user to run `flow up {slot}`")
     line(running and is_stage(info["worktree"]), f"{slot} serves its stage (the flow push target)",
-         f"ask the user to run `flow up --slot {slot}` with no name")
+         f"ask the user to run `flow up {slot}` (no --tree)")
     line(running and n > 0, f"Studio ({sinfo['label']}) connected to it",
-         f"ask the user to press Connect in {sinfo['label']}; `flow wait` in the background")
+         f"ask the user to press Connect in {sinfo['label']} (port {sinfo['port']}); `flow wait` in the background")
     for tool in ("stylua", "rojo", "git", "blink", "rokit", "wally", "luau-lsp"):
         line(shutil.which(tool) is not None, f"{tool} on PATH", "run `rokit install` in the repo")
     good, msg = setup(tree)
     line(good, msg, "fix the install error above, then doctor again")
-    print(f"agent must also check: list_roblox_studios answers and lists place {sinfo['placeId']} ({sinfo['label']}). "
-          "Use that studio_id for every Studio call this session, never another Studio. If the MCP is down, tell the user now.")
+    sid, why = find_studio(sinfo["placeId"])
+    line(bool(sid), f"Studio has {sinfo['label']} open (studio_id {sid})" if sid else f"Studio has {sinfo['label']} "
+         f"open: {why}", f"ask the user to open {sinfo['label']} in Studio (`flow open {slot}`)")
+    for p in plugin_problems():
+        print(p)
+    if sid:
+        print(f"use studio_id {sid} for every Studio call this session, never another Studio. If your roblox-studio "
+              "MCP doesn't list it, tell the user now.")
     print("when the session's work is done: `flow release`")
     if not ok:
         sys.exit(1)
@@ -848,14 +1838,183 @@ def cmd_wait(a):
         while time.time() < end:
             _, _, running, n = slot_report(cfg, slot)
             if not running:
-                die(f"{slot} server is not running. run: flow up", 2)
+                die(f"{slot} server is not running. Ask the user to run: flow up {slot}", 2)
             if n:
                 break
             time.sleep(2)
-    if n:
-        print(f"Studio connected on port {sinfo['port']}")
+    if not n:
+        die(f"timed out after {a.timeout}s waiting for Studio on port {sinfo['port']}", 3)
+    print(f"Studio connected on port {sinfo['port']}")
+    dst = served_tree(slot)
+    path = dst / stamp_path() if dst else None
+    if not path or not path.exists():
         return
-    die(f"timed out after {a.timeout}s waiting for Studio on port {sinfo['port']}", 3)
+    value = path.read_text(encoding="utf-8").strip()
+    status, sid, detail = stamp_check(sinfo["placeId"], value)
+    if status == "synced":
+        print(f"Studio synced: {sinfo['label']} has the last stamp {value} ({detail}). studio_id {sid}")
+    elif status == "stale":
+        die(f"Studio ({sinfo['label']}) has stamp {detail!r}, not the last push's {value}: Rojo isn't syncing. "
+            "Test nothing; `flow verify` checks again.", 5)
+    else:
+        print(f"note: flow couldn't read the stamp from Studio ({detail}); check {value} yourself")
+
+
+def cmd_log(a):
+    """Show a slot's Rojo log (this worktree's slot, else the default one); -f keeps following it."""
+    cfg = config()
+    slot, _ = pick_slot(cfg, a.slot or lease_of(toplevel()))
+    path = log_path(slot)
+    if not path.exists():
+        die(f"{slot} has no Rojo log yet ({path})")
+    clean = lambda t: re.sub(r"\x1b\[[0-9;]*m", "", t)  # noqa: E731
+    with open(path, encoding="utf-8", errors="replace") as fh:
+        lines = fh.read().splitlines()
+        sys.stdout.write("\n".join(clean(l) for l in lines[-a.lines:]) + ("\n" if lines else ""))
+        if not a.follow:
+            return
+        sys.stderr.write(f"(following {path}; Ctrl+C stops)\n")
+        try:
+            while True:
+                chunk = fh.read()
+                if chunk:
+                    sys.stdout.write(clean(chunk))
+                    sys.stdout.flush()
+                else:
+                    time.sleep(0.5)
+        except KeyboardInterrupt:
+            pass
+
+
+def cmd_port(a):
+    """Print a slot's port (or the main place's with `main`), for scripts."""
+    if a.slot == "main":
+        sys.stdout.write(f"{main_port()}\n")
+        return
+    cfg = config()
+    slot, sinfo = pick_slot(cfg, a.slot or lease_of(toplevel()))
+    sys.stdout.write(f"{sinfo['port']}\n")
+
+
+UNIVERSES = Path.home() / ".flow" / "universes.json"
+
+
+def universe_of(place):
+    """The universe (experience) id of a place, which Studio needs to open it. Asked from Roblox once, cached."""
+    cache = load_json(UNIVERSES, {})
+    if str(place) in cache:
+        return cache[str(place)]
+    req = urllib.request.Request(f"https://apis.roblox.com/universes/v1/places/{place}/universe",
+                                 headers={"User-Agent": "flow"})
+    with urllib.request.urlopen(req, timeout=10) as r:
+        uid = json.load(r).get("universeId")
+    if uid:
+        cache[str(place)] = uid
+        write_json(UNIVERSES, cache)
+    return uid
+
+
+def cmd_open(a):
+    """Open the slots' places in Studio (a new device: every scratch place in one go). Already open ones are
+    skipped."""
+    user_only("open")
+    cfg = config()
+    names = slot_args(a)
+    if a.all:
+        targets = list(cfg["slots"])
+    else:
+        check_slots(cfg, names)
+        targets = names or [pick_slot(cfg, None)[0]]
+    try:
+        with StudioMCP() as mcp:
+            already = {int(s.get("placeId") or 0) for s in mcp.studios()}
+    except (StudioError, OSError, ValueError):
+        already = set()
+    opened = 0
+    for slot in targets:
+        s = cfg["slots"][slot]
+        if s["placeId"] in already and not a.force:
+            print(f"{slot} {s['label']}: already open in Studio (--force opens it again)")
+            continue
+        try:
+            uid = universe_of(s["placeId"])
+        except Exception as e:
+            print(f"WARNING: couldn't look up {slot}'s experience (place {s['placeId']}): {e}")
+            continue
+        if not uid:
+            print(f"WARNING: Roblox knows no experience for {slot}'s place {s['placeId']}: wrong place id?")
+            continue
+        if opened:
+            time.sleep(2)  # one Studio launch at a time
+        os.startfile(f"roblox-studio:1+launchmode:edit+task:EditPlace+placeId:{s['placeId']}+universeId:{uid}")
+        opened += 1
+        running = slot_report(cfg, slot)[2]
+        print(f"opening {slot} {s['label']} (place {s['placeId']}) in Studio; then connect Rojo to localhost:{s['port']}"
+              + ("" if running else f" after `flow up {slot}`"))
+
+
+PIN_LINE = re.compile(r'^(?P<pre>[ \t]*flow[ \t]*=[ \t]*")(?P<repo>[\w.-]+/flow)@(?P<ver>[^"]+)"', re.M)
+
+
+def latest_release(repo, timeout=10):
+    req = urllib.request.Request(f"https://api.github.com/repos/{repo}/releases/latest",
+                                 headers={"Accept": "application/vnd.github+json", "User-Agent": "flow"})
+    with urllib.request.urlopen(req, timeout=timeout) as r:
+        return json.load(r)["tag_name"].lstrip("v")
+
+
+def cmd_pin(a):
+    """Pin the project's rokit.toml to the latest flow release (or the given version), then rokit install."""
+    user_only("pin")
+    main = main_checkout()
+    path = main / "rokit.toml"
+    text = read_raw(path) if path.exists() else "[tools]\n"
+    m = PIN_LINE.search(text)
+    repo = m.group("repo") if m else "riesegarder/flow"
+    if a.version:
+        ver = a.version.lstrip("v")
+    else:
+        try:
+            ver = latest_release(repo)
+        except Exception as e:
+            die(f"couldn't ask GitHub for the latest {repo} release ({e}); give the version: flow pin 1.2.0")
+    if m and m.group("ver") == ver:
+        print(f"rokit.toml already pins flow {ver}")
+        return
+    nl = newline_of(text)
+    if m:
+        text = text[:m.start("ver")] + ver + text[m.end("ver"):]
+    else:
+        tools = re.search(r"^\[tools\][^\r\n]*\r?\n", text, re.M)
+        line = f'flow = "{repo}@{ver}"{nl}'
+        text = text[:tools.end()] + line + text[tools.end():] if tools else text.rstrip() + f"{nl}{nl}[tools]{nl}{line}"
+    write_raw(path, text)
+    print(f"pinned flow {m.group('ver') + ' -> ' if m else ''}{ver} in rokit.toml (commit it)")
+    r = run(["rokit", "install"], cwd=main)
+    print("rokit install: done" if r.returncode == 0 else f"WARNING: rokit install failed: {(r.stdout + r.stderr).strip()[-300:]}")
+
+
+UPDATE_CACHE = Path.home() / ".flow" / "update.json"
+
+
+def update_notice():
+    """Once a day, ask GitHub for the latest flow release; say so when it's newer than this one."""
+    if is_agent() or os.environ.get("FLOW_NO_UPDATE_CHECK"):
+        return
+    cache = load_json(UPDATE_CACHE, {})
+    if time.time() - cache.get("checked", 0) > 86400:
+        try:
+            cache = {"checked": time.time(), "latest": latest_release("riesegarder/flow", timeout=3)}
+        except Exception:
+            cache = {"checked": time.time(), "latest": cache.get("latest")}
+        try:
+            write_json(UPDATE_CACHE, cache)
+        except OSError:
+            pass
+    latest = cache.get("latest")
+    if latest and semver(latest) and semver(latest) > semver(VERSION):
+        sys.stderr.write(flowui.fmt(f"note: flow {latest} is out (this is {VERSION}): `flow pin` updates this "
+                                    "project's rokit.toml") + "\n")
 
 
 # ---------------------------------------------------------------- prune
@@ -873,10 +2032,6 @@ def worktrees(main):
         elif line.startswith("prunable"):
             cur["prunable"] = True
     return out
-
-
-def same_path(a, b):
-    return os.path.normcase(os.path.abspath(str(a))) == os.path.normcase(os.path.abspath(str(b)))
 
 
 def unmerged(main, ref):
@@ -979,88 +2134,102 @@ def cmd_prune(a):
     print("done. Branches with work not in main were kept.")
 
 
-# ---------------------------------------------------------------- project config (flow.json)
-
-PROJECT_DEFAULTS = {
-    "stamp": {
-        "file": "src/Modules/Shared/FlowStamp.txt",
-        "instance": "ReplicatedStorage.Source.Modules.SharedModules.FlowStamp",
-    },
-    "generated": ["Packages/", "ServerPackages/", "DevPackages/", "sourcemap.json", "BlinkClient.luau", "BlinkServer.luau"],
-    "builtin": {"output": "error", "unused": "error", "const": "warn", "server-only": "warn"},
-    "rules": [],
-    "checks": [],
-    "commands": {},
-}
-_PROJECT = None
-
-
-def project():
-    """The project's settings: flow.json in the main checkout over PROJECT_DEFAULTS (one level deep).
-    flow.rules.json is read instead when there is no flow.json."""
-    global _PROJECT
-    if _PROJECT is not None:
-        return _PROJECT
-    cfg = json.loads(json.dumps(PROJECT_DEFAULTS))
-    root = main_checkout()
-    for name in ("flow.json", "flow.rules.json"):
-        path = root / name
-        if not path.exists():
-            continue
-        try:
-            raw = json.loads(path.read_text(encoding="utf-8"))
-        except Exception as e:
-            die(f"can't read {name}: {e}")
-        for k, v in raw.items():
-            cfg[k] = {**cfg[k], **v} if isinstance(cfg.get(k), dict) and isinstance(v, dict) else v
-        cfg["_file"] = name
-        break
-    _PROJECT = cfg
-    return cfg
-
+# ---------------------------------------------------------------- stamp + push
 
 def stamp_path():
     return project()["stamp"]["file"]
 
 
-def stamp_luau():
+def stamp_lookup():
     parts = project()["stamp"]["instance"].split(".")
     steps = "".join(f' v = v and v:FindFirstChild("{part}")' for part in parts[1:])
-    return f'local v = game:GetService("{parts[0]}"){steps} return v and v.Value'
+    return f'local v = game:GetService("{parts[0]}"){steps}'
 
 
-# ---------------------------------------------------------------- stamp
+def stamp_luau():
+    return f"{stamp_lookup()} return v and v.Value"
 
 
-def served_tree(slot=None):
+def served_tree(slot):
     cfg = config()
     slot, _ = pick_slot(cfg, slot)
-    info = state().get(slot)
-    return Path(info["worktree"]) if info and pid_alive(info["pid"]) else None
+    _, info, running, _ = slot_report(cfg, slot)
+    return Path(info["worktree"]) if running else None
 
 
-def mirror(src, dst):
-    """Make dst's tracked + untracked files equal src's working tree (HEAD plus uncommitted edits)."""
+def tree_files(tree):
+    """Tracked + untracked (not ignored) files that exist in tree's working copy, minus flow's own."""
+    p = run(["git", "ls-files", "-z", "-co", "--exclude-standard"], cwd=tree)
+    skip = lambda f: f.startswith(".claude/") or f == stamp_path()  # noqa: E731
+    return {f for f in p.stdout.split("\0") if f and not skip(f) and (tree / f).is_file()}
+
+
+def parents(path):
+    parts = path.split("/")[:-1]
+    return {"/".join(parts[:i]) for i in range(1, len(parts) + 1)}
+
+
+def mirror(src, dst, place_ids=()):
+    """Make dst's files equal src's working tree (HEAD plus uncommitted edits), changing only what differs.
+
+    Rojo 7.7.1 panics (change_processor.rs:179 NotFound) when a folder disappears while it still handles the
+    removal of the files in it, which `git checkout --force` + `git clean` did whenever the next session's branch
+    lacked folders the last one had. So: delete the files, give Rojo a second, then remove the folders nothing
+    needs any more one depth level at a time (deepest first), and write changed files in place (never temp file +
+    rename). The stage's default.project.json keeps every slot's place in servePlaceIds."""
     head = run(["git", "rev-parse", "HEAD"], cwd=src, check=True).stdout.strip()
-    run(["git", "checkout", "--detach", "--force", head], cwd=dst, check=True)
-    run(["git", "clean", "-fdq"], cwd=dst)  # ignored files (Packages links, sourcemap, stamp) stay
-    copied = deleted = 0
-    for line in run(["git", "status", "--porcelain", "-uall"], cwd=src).stdout.splitlines():
-        code, path = line[:2], line[3:].strip('"')
-        if " -> " in path:
-            old, path = path.split(" -> ")
-            (dst / old.strip('"')).unlink(missing_ok=True)
-            path = path.strip('"')
-        if path.startswith(".claude/") or path == stamp_path():
-            continue
-        if "D" in code:
-            (dst / path).unlink(missing_ok=True)
-            deleted += 1
+    want, have = tree_files(src), tree_files(dst)
+    gone = sorted(have - want)
+    for f in gone:
+        (dst / f).unlink(missing_ok=True)
+    needed = set().union(*(parents(f) for f in want)) if want else set()
+    dirs = (set().union(*(parents(f) for f in gone)) - needed) if gone else set()
+    for depth in sorted({d.count("/") for d in dirs}, reverse=True):
+        time.sleep(1.0 if depth == max(d.count("/") for d in dirs) else 0.5)
+        for d in (d for d in dirs if d.count("/") == depth):
+            try:
+                (dst / d).rmdir()  # only when empty: ignored files (packages, sourcemap) stay
+            except OSError:
+                pass
+    changed, project_changed = 0, False
+    for f in sorted(want):
+        data = (src / f).read_bytes()
+        if f == "default.project.json" and place_ids:
+            try:
+                text = data.decode("utf-8-sig")
+                data = add_place_ids_text(text, place_ids)[0].encode("utf-8")
+            except ValueError:
+                pass
+        t = dst / f
+        if t.is_file():
+            old = t.read_bytes()
+            if old == data:
+                continue
+            if f == "default.project.json":
+                project_changed = project_differs(old, data)
+            with open(t, "r+b") as fh:
+                fh.write(data)
+                fh.truncate()
         else:
-            (dst / path).parent.mkdir(parents=True, exist_ok=True)
-            shutil.copy2(src / path, dst / path)
-            copied += 1
-    return head, copied, deleted
+            t.parent.mkdir(parents=True, exist_ok=True)
+            t.write_bytes(data)
+        changed += 1
+    run(["git", "reset", "-q", head], cwd=dst)  # HEAD and index follow; the files are already right
+    return head, changed, len(gone), project_changed
+
+
+def project_differs(old, new):
+    """True when two default.project.json versions differ in more than formatting, servePort and servePlaceIds
+    (flow serves on the slot's port and keeps every slot's place in the list itself)."""
+    try:
+        a, b = (json.loads(x.decode("utf-8-sig")) for x in (old, new))
+    except ValueError:
+        return True
+    for d in (a, b):
+        if isinstance(d, dict):
+            d.pop("servePort", None)
+            d.pop("servePlaceIds", None)
+    return a != b
 
 
 def blink_outputs(tree):
@@ -1090,44 +2259,138 @@ def regen_blink(tree):
     print(f"blink: regenerated {', '.join(changed)}" if changed else "blink: networking files up to date")
 
 
+def restart_slot(slot, sinfo, dst, main, was_connected, why):
+    """Serve the stage again on the same port. With the reconnecting plugin, wait until Studio is back; else
+    tell the user to press Connect. Returns True when Studio is connected again."""
+    print(why)
+    print(f"restarting {slot}'s Rojo on port {sinfo['port']}")
+    serve(slot, sinfo, dst, main)
+    if not was_connected:
+        return False
+    if plugin_reconnects():
+        return not await_reconnect([slot])
+    notify("flow: reconnect Studio", f"{slot} [{sinfo['port']}]: Rojo restarted by a push")
+    print(f"Ask the user to press Connect in {sinfo['label']} (port {sinfo['port']}); run `flow wait` in the "
+          "background: it checks the stamp once Studio is back.")
+    return False
+
+
 def cmd_push(a):
     heal()
     src = toplevel()
-    if not same_path(src, main_checkout()) and not is_stage(src):
+    main = main_checkout()
+    if not same_path(src, main) and not is_stage(src):
         synced, msg = sync_with_main(src)
         if not synced:
             die(f"{msg}. Studio would run old code: resolve the rebase first "
                 "(`git rebase main`, fix conflicts, `git rebase --continue`), then push again.", 2)
         if "rebased" in msg:
             print(msg)
-    slot, new = claim(src, getattr(a, "slot", None))
-    sinfo = config()["slots"][slot]
+    slot, new = claim(src, one_slot(a))
+    cfg = config()
+    sinfo = cfg["slots"][slot]
     if new:
         print(f"claimed {slot} ({sinfo['label']}, place {sinfo['placeId']})")
     dst = served_tree(slot)
     if not dst:
-        die(f"nothing is served on {slot}. Ask the user to run `flow up --slot {slot}` in their terminal.", 2)
+        crash = f" (its Rojo crashed:\n{log_tail(slot)}\n)" if crashed(slot) else ""
+        die(f"nothing is served on {slot}{crash}. Ask the user to run `flow up {slot}` in their terminal.", 2)
+    touched, restart = 0, None
+    was_connected = studio_connected(sinfo["port"])
     if same_path(src, dst):
         print("this tree is the served one; just stamping")
     elif not is_stage(dst):
         die(f"{slot} serves {dst.name}, a real worktree, not a stage: pushing would overwrite its files. "
-            f"Ask the user to run `flow up --slot {slot}` (no name) so its stage is served.", 2)
+            f"Ask the user to run `flow up {slot}` (no --tree) so its stage is served.", 2)
     else:
         with busy(f"Syncing {src.name} onto the {dst.name} stage"):
-            head, copied, deleted = mirror(src, dst)
-        print(f"pushed {src.name} @ {head[:7]} to {dst.name} ({copied} uncommitted file(s) copied, {deleted} deleted)")
+            head, changed, deleted, project_changed = mirror(src, dst, slot_place_ids())
+        touched = changed + deleted
+        print(f"pushed {src.name} @ {head[:7]} to {dst.name} ({changed} file(s) changed, {deleted} deleted)")
+        # a restart costs nothing when nobody is connected or the plugin reconnects by itself (riesegarder/rojo)
+        restart_ok = not was_connected or plugin_reconnects()
         # never reinstall under a running rojo: wally recreates the package folders and rojo stops syncing them
         if not packages_current(dst):
-            die(f"the stage's packages don't match this push's wally.toml/wally.lock (or are still links). "
-                f"Ask the user to run `flow up --slot {slot}` (installs, then restarts rojo), then push again.", 2)
+            if not restart_ok:
+                die(f"the stage's packages don't match this push's wally.toml/wally.lock (or are still links). "
+                    f"Ask the user to run `flow up {slot}` (installs, then restarts rojo), then push again.", 2)
+            restart = "the packages changed (wally.toml/wally.lock): reinstalling them on the stage"
+        elif project_changed:
+            if restart_ok:
+                restart = ("default.project.json changed: Rojo doesn't apply every project change (Workspace or "
+                           "Lighting properties) to a connected place")
+            else:
+                print(f"WARNING: default.project.json changed. Rojo doesn't apply every project change (Workspace or "
+                      f"Lighting properties) to a connected place: if Studio misses one, ask the user to run "
+                      f"`flow restart {slot}` and reconnect.")
     regen_blink(dst)
-    print(f"Studio: {sinfo['label']}, placeId {sinfo['placeId']} (pick that studio_id)")
-    write_stamp(dst, src)
+    if touched:
+        time.sleep(1.0)  # a panic comes while rojo processes the change events
+        forget_snapshot()
+        if not rojo_listeners().get(sinfo["port"]):
+            tail = log_tail(slot)
+            restart = f"WARNING: {slot}'s Rojo stopped during the push" + (f":\n{tail}" if tail else "")
+    if restart:
+        restart_slot(slot, sinfo, dst, main, was_connected, restart)
+    value = write_stamp(dst, src)
+    report_stamp(slot, sinfo, value)
 
 
 def cmd_stamp(a):
-    a.slot = None
+    a.slot = a.slot_pos = None
     return cmd_push(a)
+
+
+def report_stamp(slot, sinfo, value, timeout=20):
+    """Check Studio has this stamp: flow reads it back through the Studio MCP. Exits 5 when Studio has another
+    one (Rojo isn't syncing). When flow can't read it, prints how to check by hand."""
+    hints = [h.replace("{stamp}", value) for h in
+             project()["stamp"].get("hint", ["2. Only then test: results from an unsynced place don't count."])]
+    manual = (f"1. Edit datamodel, must return exactly the stamp above (else Rojo isn't synced: stop, wait for "
+              f"reconnect): {stamp_luau()}")
+    if not studio_connected(sinfo["port"]):
+        print(f"Studio isn't connected to {slot}: ask the user to press Connect in {sinfo['label']} (port "
+              f"{sinfo['port']}) and run `flow wait` in the background; it checks the stamp once Studio is back.")
+        print("\n".join([manual] + hints))
+        return
+    status, sid, detail = stamp_check(sinfo["placeId"], value, timeout)
+    if status == "synced":
+        print(f"Studio synced: {sinfo['label']} has this stamp ({detail}). studio_id {sid}: use it for every Studio "
+              "call, never another one")
+        print("\n".join(hints))
+    elif status == "stale":
+        die(f"Studio ({sinfo['label']}, studio_id {sid}) still has stamp {detail!r} after {timeout}s, not {value}: "
+            f"Rojo isn't syncing it. Test nothing. If Studio shows Rojo disconnected, ask the user to press Connect "
+            f"(port {sinfo['port']}), then run `flow verify`.", 5)
+    else:
+        print(f"note: flow couldn't read the stamp from Studio ({detail}). Pick the studio_id whose placeId is "
+              f"{sinfo['placeId']} and check it yourself:")
+        print("\n".join([manual] + hints))
+
+
+def cmd_verify(a):
+    """Check Studio has the stamp the last push wrote (after a reconnect, say)."""
+    heal()
+    cfg = config()
+    slot, sinfo = pick_slot(cfg, one_slot(a) or lease_of(toplevel()))
+    dst = served_tree(slot)
+    if not dst:
+        die(f"nothing is served on {slot}. Ask the user to run `flow up {slot}`.", 2)
+    path = dst / stamp_path()
+    if not path.exists():
+        die(f"{slot}'s stage has no stamp yet: `flow push` writes one", 2)
+    value = path.read_text(encoding="utf-8").strip()
+    print(value)
+    if not studio_connected(sinfo["port"]):
+        die(f"Studio isn't connected to {slot} (port {sinfo['port']}). Ask the user to press Connect in "
+            f"{sinfo['label']}; `flow wait` in the background.", 2)
+    status, sid, detail = stamp_check(sinfo["placeId"], value, a.timeout)
+    if status == "synced":
+        print(f"Studio synced: {sinfo['label']} has this stamp ({detail}). studio_id {sid}")
+    elif status == "stale":
+        die(f"Studio ({sinfo['label']}) has stamp {detail!r}, not {value}: Rojo isn't syncing. Test nothing.", 5)
+    else:
+        die(f"flow couldn't read the stamp from Studio: {detail}", 6)
 
 
 def write_stamp(root, src):
@@ -1146,9 +2409,7 @@ def write_stamp(root, src):
     (root / stamp_path()).parent.mkdir(parents=True, exist_ok=True)
     (root / stamp_path()).write_text(value, encoding="utf-8")
     print(value)
-    print(f"1. Edit datamodel, must return exactly the stamp above (else Rojo isn't synced: stop, wait for reconnect): {stamp_luau()}")
-    for line in project()["stamp"].get("hint", ["2. Only then test: results from an unsynced place don't count."]):
-        print(line.replace("{stamp}", value))
+    return value
 
 
 # ---------------------------------------------------------------- check
@@ -1365,6 +2626,11 @@ def builtin(rule):
     return None if sev == "off" else ("ERROR" if sev == "error" else "WARN")
 
 
+def ignored(path):
+    """flow.json "ignore": files the built-in checks and the type check skip (Lune scripts aren't Roblox code)."""
+    return any(glob_re(g).match(path) for g in project().get("ignore", []))
+
+
 def scan_file(root, base, path, text, added, rules=()):
     lines = text.splitlines()
     sev = {k: builtin(k) for k in ("output", "unused", "const", "server-only")}
@@ -1372,6 +2638,8 @@ def scan_file(root, base, path, text, added, rules=()):
     names_re = re.compile(r"^\s*(?:local|const)\s+(?:function\s+)?([A-Za-z_]\w*(?:\s*,\s*[A-Za-z_]\w*)*)\s*[=(:]")
 
     apply_rules(rules, path, text, added)
+    if ignored(path):
+        return
 
     for ln, line in added.items():
         if is_comment(line):
@@ -1403,14 +2671,22 @@ def cmd_check(a):
     else:
         mb = run(["git", "merge-base", "HEAD", "main"], cwd=root)
         base = mb.stdout.strip() if mb.returncode == 0 and mb.stdout.strip() else "HEAD"
+    # Blink output is regenerated from network.blink (as up and push do), so it only differs from the base when
+    # the schema changed or the committed copy was stale: never an edit to flag
+    blink = set()
+    if (root / "network.blink").exists():
+        regen_blink(root)
+        blink = {os.path.relpath(o, root).replace("\\", "/") for o in blink_outputs(root)}
     files = a.files or changed_files(root, base)
     files = [f.replace("\\", "/") for f in files]
     if not files:
         print("nothing changed against", base[:10])
         return
-    luau = [f for f in files if f.endswith(".luau") and (root / f).exists()]
+    luau = [f for f in files if f.endswith(".luau") and (root / f).exists() and f not in blink]
 
     for f in files:
+        if f in blink:
+            continue
         if any(f.startswith(g) or f.endswith(g) for g in project()["generated"]):
             finding("ERROR", f, 0, "generated", "generated file touched; leave it alone")
 
@@ -1426,11 +2702,16 @@ def cmd_check(a):
     types = "type check skipped: no luau files changed"
     if luau:
         ok, msg = setup(root)
-        types = type_check(root, luau, added_by_file) if ok else f"type check skipped: {msg}"
+        typed = [f for f in luau if not ignored(f)]
+        if not typed:
+            types = "type check skipped: only ignored files changed"
+        else:
+            types = type_check(root, typed, added_by_file) if ok else f"type check skipped: {msg}"
 
     style = []
     if luau:
-        p = run(["stylua", "--check"] + luau, cwd=root)
+        # files named on the command line skip .styluaignore unless told otherwise
+        p = run(["stylua", "--check", "--respect-ignores"] + luau, cwd=root)
         if p.returncode != 0:
             out = re.sub(r"\x1b\[[0-9;]*m", "", p.stdout + p.stderr)
             style = sorted(set(re.findall(r"^Diff in (.+?):\s*$", out, re.M)))
@@ -1472,41 +2753,84 @@ def project_commands():
         return {}
 
 
+# commands that run or look at Rojo servers (Windows only for now) and need the repo's slot state
+SERVER_CMDS = {"up", "down", "restart", "update", "status", "doctor", "where", "wait", "push", "stamp", "release",
+               "ports", "slot", "register", "prune", "verify", "open", "log", "port"}
+# commands after which this machine's old slots are saved in flow.json (never from an agent)
+ADOPT_CMDS = {"up", "slot", "status", "ports", "register", "restart", "update", "down", "open"}
+
+
 def main():
     ap = argparse.ArgumentParser(prog="flow", description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("--version", action="version", version=f"flow {VERSION}")
     sub = ap.add_subparsers(dest="cmd", required=True)
-    s = sub.add_parser("up")
-    s.add_argument("name", nargs="?")
-    s.add_argument("--slot")
+
+    def slot_option(s, text="this slot"):
+        s.add_argument("slot_pos", nargs="?", metavar="slot", help=text)
+        s.add_argument("--slot", help=argparse.SUPPRESS)  # flow <= 1.1 spelling
+
+    s = sub.add_parser("up", help="serve slots' stages (the default slot when none is given)")
+    s.add_argument("slots", nargs="*", help="slot names")
+    s.add_argument("--slot", help=argparse.SUPPRESS)
+    s.add_argument("--tree", help="serve this worktree (.claude/worktrees/<name>) instead of the stage; push then refuses")
     s.add_argument("--base", default="main")
     s.add_argument("--all", action="store_true", help="serve every slot's stage")
     s.add_argument("--quiet", action="store_true", help="no toast notification")
     s.set_defaults(fn=cmd_up)
-    s = sub.add_parser("slot", help="add or update a slot (a scratch place with its own port and stage)")
-    s.add_argument("name")
-    s.add_argument("place", type=int)
+    s = sub.add_parser("slot", help="list slots, or add/update one (saved in flow.json) and serve it")
+    s.add_argument("name", nargs="?")
+    s.add_argument("place", nargs="?", help="place id, or a roblox.com/games/<id> link")
     s.add_argument("--label")
-    s.add_argument("--port", type=int)
+    s.add_argument("--port", type=int, help="this machine's port for the slot")
+    s.add_argument("--here", action="store_true", help="only this machine uses the slot (adds its name to hosts)")
+    s.add_argument("--remove", action="store_true", help="remove the slot (stops its server)")
+    s.add_argument("--no-up", action="store_true", help="don't serve it now")
+    s.add_argument("--no-add", action="store_true", help="don't add the place to default.project.json servePlaceIds")
+    s.add_argument("--quiet", action="store_true", help="no toast notification")
     s.set_defaults(fn=cmd_slot)
+    s = sub.add_parser("ports", help="renumber the slot ports from the main place port (moves running servers)")
+    s.add_argument("--dry-run", action="store_true", help="only show the new ports")
+    s.add_argument("--quiet", action="store_true", help="no toast notification")
+    s.set_defaults(fn=cmd_ports)
     s = sub.add_parser("register", help="reserve this project's main-place port so slots never share it")
     s.set_defaults(fn=cmd_register)
     s = sub.add_parser("release", help="free this worktree's Studio slot for other sessions")
-    s.add_argument("--slot", help="free a given slot (user only)")
+    slot_option(s, "free this slot instead (user only)")
+    s.add_argument("--stale", action="store_true", help="free every slot that saw no push for a while (user only)")
+    s.add_argument("--older-than", type=float, default=STALE_HOURS, help=f"hours, for --stale (default {STALE_HOURS})")
     s.set_defaults(fn=cmd_release)
-    s = sub.add_parser("down", help="stop a slot's server, or every server with `down all`")
+    s = sub.add_parser("open", help="open the slots' places in Studio (the default slot when none is given)")
+    s.add_argument("slots", nargs="*", help="slot names")
+    s.add_argument("--all", action="store_true", help="every slot's place")
+    s.add_argument("--force", action="store_true", help="open it even when a Studio already has it")
+    s.set_defaults(fn=cmd_open)
+    s = sub.add_parser("pin", help="pin this project's rokit.toml to the latest flow release (or VERSION)")
+    s.add_argument("version", nargs="?")
+    s.set_defaults(fn=cmd_pin)
+    s = sub.add_parser("log", help="a slot's Rojo log (this worktree's slot, else the default)")
     s.add_argument("slot", nargs="?")
+    s.add_argument("-n", "--lines", type=int, default=40)
+    s.add_argument("-f", "--follow", action="store_true", help="keep printing new lines")
+    s.set_defaults(fn=cmd_log)
+    s = sub.add_parser("port", help="print a slot's port (`main`: the main place's), for scripts")
+    s.add_argument("slot", nargs="?")
+    s.set_defaults(fn=cmd_port)
+    s = sub.add_parser("down", help="stop slots' servers, or every server with `down all`")
+    s.add_argument("slots", nargs="*", help="slot names, or all")
+    s.add_argument("--slot", help=argparse.SUPPRESS)
     s.add_argument("--all", action="store_true", help="stop every slot's server")
     s.add_argument("--port", type=int, help="stop whatever rojo listens on this port (a stale server)")
     s.set_defaults(fn=cmd_down)
 
-    for name, pull, text in (("restart", False, "restart the running servers (all slots with --all)"),
+    for name, pull, text in (("restart", False, "restart the running servers (or the given slots, or all with --all)"),
                              ("update", True, "pull origin/main into local main, then restart the running servers")):
         s = sub.add_parser(name, help=text)
+        s.add_argument("slots", nargs="*", help="slot names")
         s.add_argument("--all", action="store_true", help="restart every slot, not only the running ones")
         s.add_argument("--quiet", action="store_true", help="no toast notification")
         s.set_defaults(pull=pull, fn=cmd_restart)
     s = sub.add_parser("status")
+    s.add_argument("--json", action="store_true", help="machine-readable")
     s.set_defaults(fn=cmd_status)
     s = sub.add_parser("prune", help="list (default) or remove stale worktrees; the served one is always kept")
     s.add_argument("--yes", action="store_true", help="actually remove (user only)")
@@ -1516,16 +2840,21 @@ def main():
     s.add_argument("--older-than", type=float, default=3, help="keep worktrees active within this many hours (default 3)")
     s.set_defaults(fn=cmd_prune)
     s = sub.add_parser("doctor", help="session preflight: claim a free Studio slot, check server, Studio, tools")
-    s.add_argument("--slot", help="claim this slot (only if the user said so)")
+    slot_option(s, "claim this slot (only if the user said so)")
     s.set_defaults(fn=cmd_doctor)
-    s = sub.add_parser("where", help="this worktree's slot, Studio place and stage")
+    s = sub.add_parser("where", help="this worktree's slot, Studio place, studio_id and stage")
+    s.add_argument("--json", action="store_true", help="machine-readable")
     s.set_defaults(fn=cmd_where)
+    s = sub.add_parser("verify", help="check Studio has the stamp the last push wrote")
+    slot_option(s, "this slot instead of this worktree's")
+    s.add_argument("--timeout", type=int, default=20)
+    s.set_defaults(fn=cmd_verify)
     s = sub.add_parser("wait")
     s.add_argument("slot", nargs="?")
     s.add_argument("--timeout", type=int, default=600)
     s.set_defaults(fn=cmd_wait)
     s = sub.add_parser("push", help="mirror this worktree (HEAD + uncommitted edits) onto the served stage, then stamp")
-    s.add_argument("--slot")
+    slot_option(s, "claim this slot first (only if the user said so)")
     s.set_defaults(fn=cmd_push)
     s = sub.add_parser("stamp", help="write a fresh FlowStamp so Studio's synced copy can be verified")
     s.set_defaults(fn=cmd_stamp)
@@ -1540,7 +2869,21 @@ def main():
         s.add_argument("args", nargs=argparse.REMAINDER)
         s.set_defaults(fn=cmd_project)
     a = ap.parse_args()
+    if getattr(a, "json", False):  # stdout carries only the JSON
+        globals()["print"] = lambda *x, **k: flowui.builtins.print(*x, file=sys.stderr, **k)
+    if a.cmd == "pin" and not _COMMON:
+        die("not inside a git repo")
+    if a.cmd in SERVER_CMDS:
+        if not WINDOWS:
+            die(f"`flow {a.cmd}` runs Rojo servers and is Windows only for now; `flow check` works everywhere")
+        if not _COMMON:
+            die("not inside a git repo")
+        migrate()
+        if a.cmd in ADOPT_CMDS:
+            adopt_slots()
     a.fn(a)
+    if a.cmd not in ("port", "pin") and not getattr(a, "json", False):
+        update_notice()
 
 
 if __name__ == "__main__":
